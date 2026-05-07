@@ -25,29 +25,55 @@ DEFAULT_CSV = Path(r"F:\双通道睡眠实验\2026_0413晚\数据\20260414_03331
 
 @dataclass
 class GateConfig:
+    """质量门控的全部参数。
+
+    这里的参数不是训练出来的模型权重，而是一套可解释的工程阈值。
+    默认值适合当前 500 Hz 床下 PVDF + 压阻双通道数据；正式论文里可以做
+    参数敏感性分析，例如比较 20 s、30 s、60 s 窗口。
+    """
+
+    # 原始采样率和降采样设置：500 Hz / 10 = 50 Hz，足够覆盖呼吸和体动特征。
     fs_raw: float = 500.0
     downsample_q: int = 10
+
+    # ADC 转电压参数。12 bit ADC 常见范围是 0-4095，参考电压按 3.3 V 计算。
     adc_max: float = 4095.0
     adc_vref: float = 3.3
+
+    # 窗口级 SQI 参数。window_sec 越长越稳定但响应越慢；step_sec 越小结果越密。
     window_sec: float = 30.0
     step_sec: float = 5.0
+
+    # 体动门控参数：超过阈值的点被认为是体动，并向前后扩展 motion_dilate_sec 秒。
     motion_dilate_sec: float = 2.0
     motion_threshold_z: float = 3.0
+
+    # 双通道融合权重。0.5 表示 PVDF 和压阻对体动判断同等重要。
     pvdf_weight: float = 0.5
+
+    # 呼吸频段。0.10-0.60 Hz 对应 6-36 bpm，用于频谱质量评价和带通滤波。
     resp_low_hz: float = 0.10
     resp_high_hz: float = 0.60
+
+    # 总能量参考频段。呼吸频带能量 / 总能量越高，说明窗口越像稳定呼吸。
     total_low_hz: float = 0.05
     total_high_hz: float = 1.50
+
+    # 呼吸峰检测参数。最小峰间距 2.5 s 等价于不允许超过约 24 bpm 的峰间距估计。
     resp_peak_min_dist_sec: float = 2.5
     resp_peak_prom_ratio: float = 0.15
     rr_min_bpm: float = 6.0
     rr_max_bpm: float = 24.0
+
+    # 文件开头/结尾零相位滤波容易有边缘伪峰，这几秒不参与体动判断。
     edge_guard_sec: float = 3.0
-    bad_fraction_max: float = 0.05
-    motion_reject_fraction: float = 0.25
-    motion_warn_fraction: float = 0.08
-    min_resp_band_ratio: float = 0.35
-    min_pass_quality: float = 60.0
+
+    # 窗口分类阈值。
+    bad_fraction_max: float = 0.05       # 异常 ADC 比例超过 5%，窗口直接判 invalid。
+    motion_reject_fraction: float = 0.25 # 体动占窗口超过 25%，窗口判 motion。
+    motion_warn_fraction: float = 0.08   # 体动占 8%-25%，窗口还能用但标成 usable。
+    min_resp_band_ratio: float = 0.35    # 呼吸频带能量占比低于 35%，窗口判 low_quality。
+    min_pass_quality: float = 60.0       # SQI 低于 60，即使标签可用也不通过门控。
 
     @property
     def fs(self) -> float:
@@ -192,6 +218,14 @@ def expand_mask(mask: np.ndarray, radius_samples: int) -> np.ndarray:
 
 
 def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> dict[str, np.ndarray | float]:
+    """计算逐采样点体动门控。
+
+    每个通道先算一个 motion score：
+    1. 原信号快速变化率，用来抓短时冲击和翻身；
+    2. 包络变化率，用来抓慢一点的姿态/压力重分布变化。
+
+    两个通道再按 pvdf_weight 加权融合，最后用 median + k*MAD 的鲁棒阈值判体动。
+    """
     pvdf_motion = channel_motion_score(pvdf, cfg.fs)
     pr_motion = channel_motion_score(pr, cfg.fs)
     fused = cfg.pvdf_weight * pvdf_motion["score"] + (1.0 - cfg.pvdf_weight) * pr_motion["score"]
@@ -307,18 +341,45 @@ def iter_windows(n: int, cfg: GateConfig) -> list[tuple[int, int]]:
 
 
 def classify_window(row: dict[str, float], cfg: GateConfig) -> tuple[str, bool, float]:
+    """把一个 30 s 窗口的特征转换成 label、pass_gate 和 SQI。
+
+    SQI 的思路是“先给基础分，再奖励稳定呼吸特征，最后扣除体动/坏点/双通道不一致”。
+    当前公式：
+
+        SQI = 50
+              + 呼吸频带能量奖励，最多 +30
+              + 频谱主峰突出程度奖励，最多 +15
+              + 呼吸峰间期稳定性奖励，最多 +10
+              - 体动占比惩罚，最多按 80 * motion_fraction 扣
+              - 坏点占比惩罚，最多按 120 * bad_fraction 扣
+              - PVDF/压阻呼吸率不一致惩罚，最多扣 20
+
+    最后把 SQI 限制在 0-100。分类不是只看 SQI：先用硬规则判 invalid/motion/
+    low_quality/usable/good，再要求 good 或 usable 且 SQI >= min_pass_quality 才通过。
+    """
     rr_ok = np.isfinite(row["pvdf_rr_bpm"]) and cfg.rr_min_bpm <= row["pvdf_rr_bpm"] <= cfg.rr_max_bpm
-    quality = 50.0
-    quality += 30.0 * np.clip((row["pvdf_resp_band_ratio"] - 0.20) / 0.60, 0.0, 1.0)
-    quality += 15.0 * np.clip((row["pvdf_dominance"] - 1.5) / 8.0, 0.0, 1.0)
+
+    resp_band_bonus = 30.0 * np.clip((row["pvdf_resp_band_ratio"] - 0.20) / 0.60, 0.0, 1.0)
+    dominance_bonus = 15.0 * np.clip((row["pvdf_dominance"] - 1.5) / 8.0, 0.0, 1.0)
+    stability_bonus = 0.0
     if np.isfinite(row["pvdf_ibi_cv"]):
-        quality += 10.0 * np.clip((0.35 - row["pvdf_ibi_cv"]) / 0.35, 0.0, 1.0)
-    quality -= 80.0 * row["motion_fraction"]
-    quality -= 120.0 * row["bad_fraction"]
+        stability_bonus = 10.0 * np.clip((0.35 - row["pvdf_ibi_cv"]) / 0.35, 0.0, 1.0)
 
+    motion_penalty = 80.0 * row["motion_fraction"]
+    bad_penalty = 120.0 * row["bad_fraction"]
+    rr_disagreement_penalty = 0.0
     if np.isfinite(row["rr_abs_diff_bpm"]):
-        quality -= min(20.0, 1.5 * row["rr_abs_diff_bpm"])
+        rr_disagreement_penalty = min(20.0, 1.5 * row["rr_abs_diff_bpm"])
 
+    quality = (
+        50.0
+        + resp_band_bonus
+        + dominance_bonus
+        + stability_bonus
+        - motion_penalty
+        - bad_penalty
+        - rr_disagreement_penalty
+    )
     quality = float(np.clip(quality, 0.0, 100.0))
 
     if row["bad_fraction"] > cfg.bad_fraction_max:
@@ -342,6 +403,13 @@ def build_window_table(
     gate: dict[str, np.ndarray | float],
     cfg: GateConfig,
 ) -> pd.DataFrame:
+    """生成窗口级结果表。
+
+    每一行对应一个滑动窗口，默认是 30 s 窗、5 s 步长。窗口大小可以放宽：
+    - 20 s：更敏感，能更快定位短时体动，但呼吸频率估计会更抖；
+    - 30 s：当前折中默认值；
+    - 60 s：更稳定，适合整晚统计，但体动定位会更粗。
+    """
     rows: list[dict[str, float | str | bool]] = []
     for start, end in iter_windows(len(data["t"]), cfg):
         pvdf_feat = respiration_features(resp[start:end], cfg)
@@ -599,12 +667,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PVDF + piezoresistive dual-channel quality gating.")
     parser.add_argument("--input", type=Path, default=DEFAULT_CSV, help="CSV file or a directory of CSV files.")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs"), help="Directory for generated tables/figures.")
-    parser.add_argument("--window-sec", type=float, default=30.0)
-    parser.add_argument("--step-sec", type=float, default=5.0)
-    parser.add_argument("--motion-threshold-z", type=float, default=3.0)
-    parser.add_argument("--pvdf-weight", type=float, default=0.5)
-    parser.add_argument("--fs-raw", type=float, default=500.0)
-    parser.add_argument("--downsample-q", type=int, default=10)
+    parser.add_argument("--window-sec", type=float, default=30.0, help="SQI window length in seconds; try 20, 30, or 60.")
+    parser.add_argument("--step-sec", type=float, default=5.0, help="Sliding-window step in seconds.")
+    parser.add_argument("--motion-threshold-z", type=float, default=3.0, help="Robust z threshold for motion detection.")
+    parser.add_argument("--pvdf-weight", type=float, default=0.5, help="PVDF weight in fused motion score; PR weight is 1-this.")
+    parser.add_argument("--fs-raw", type=float, default=500.0, help="Raw sampling rate in Hz.")
+    parser.add_argument("--downsample-q", type=int, default=10, help="Downsampling factor; 500/10 gives 50 Hz.")
     return parser.parse_args()
 
 
