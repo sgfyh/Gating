@@ -52,9 +52,9 @@ class GateConfig:
     # 注意：压阻只用于体动门控，不再用于呼吸率估计或 SQI 的呼吸一致性惩罚。
     pvdf_weight: float = 0.5
 
-    # 单通道体动分数的三个分量权重。
-    # voltage_rate：短时电压跳变；envelope_rate：幅度/接触状态改变；
-    # wavelet_motion：非呼吸高频/宽带细节能量。可设为 0 做“只用平滑变化率”的消融。
+    # 体动分数的三个特征级权重。
+    # voltage_rate/envelope_rate 使用 PVDF+压阻双通道融合；
+    # wavelet_motion 只使用 PVDF，因为压阻高频更可能是电路噪声而不是体动。
     voltage_rate_weight: float = 0.40
     envelope_rate_weight: float = 0.40
     wavelet_motion_weight: float = 0.20
@@ -201,8 +201,20 @@ def extract_pvdf_respiration(pvdf: np.ndarray, cfg: GateConfig) -> np.ndarray:
     return bandpass(resp, cfg.fs, cfg.resp_low_hz, cfg.resp_high_hz)
 
 
+def motion_feature_weights(cfg: GateConfig) -> np.ndarray:
+    weights = np.array(
+        [cfg.voltage_rate_weight, cfg.envelope_rate_weight, cfg.wavelet_motion_weight],
+        dtype=float,
+    )
+    weights = np.clip(weights, 0.0, None)
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 1e-12:
+        return np.array([0.5, 0.5, 0.0], dtype=float)
+    return weights / weight_sum
+
+
 def wavelet_motion_energy_z(x: np.ndarray, cfg: GateConfig) -> np.ndarray:
-    """用小波细节能量描述非呼吸瞬态扰动。
+    """用 PVDF 小波细节能量描述非呼吸瞬态扰动。
 
     它不是用来估计呼吸，而是补充体动门控：稳定心冲击/噪声如果能量长期存在，
     鲁棒 z 分数不会很高；翻身、碰撞、接触状态突变通常会让细节能量短时升高。
@@ -226,13 +238,13 @@ def wavelet_motion_energy_z(x: np.ndarray, cfg: GateConfig) -> np.ndarray:
     return robust_positive_z(detail_energy)
 
 
-def channel_motion_score(x: np.ndarray, cfg: GateConfig) -> dict[str, np.ndarray]:
-    """计算单通道体动分数。
+def channel_motion_features(x: np.ndarray, cfg: GateConfig, *, include_wavelet: bool) -> dict[str, np.ndarray]:
+    """计算单通道体动特征。
 
     电压变化率和包络变化率有相关性，但不完全重复：
     - 电压变化率更像“一阶导数”，对瞬时冲击敏感；
     - 包络变化率看的是交流幅度变化，对接触状态、姿态改变更敏感；
-    - 小波细节能量看非呼吸高频/宽带瞬态，只作为弱补充。
+    - 小波细节能量只在 PVDF 上计算，因为 PVDF 对振动/冲击有高频响应基础。
     """
     fs = cfg.fs
     smooth = moving_average(x, int(round(0.3 * fs)))
@@ -242,22 +254,12 @@ def channel_motion_score(x: np.ndarray, cfg: GateConfig) -> dict[str, np.ndarray
 
     env_rate_z = robust_positive_z(abs_rate(env, fs))
     voltage_rate_z = robust_positive_z(abs_rate(smooth, fs))
-    wavelet_energy_z = wavelet_motion_energy_z(x, cfg)
+    if include_wavelet:
+        wavelet_energy_z = wavelet_motion_energy_z(x, cfg)
+    else:
+        wavelet_energy_z = np.zeros_like(x, dtype=float)
 
-    weights = np.array(
-        [cfg.voltage_rate_weight, cfg.envelope_rate_weight, cfg.wavelet_motion_weight],
-        dtype=float,
-    )
-    weights = np.clip(weights, 0.0, None)
-    weight_sum = float(np.sum(weights))
-    if weight_sum <= 1e-12:
-        weights = np.array([0.5, 0.5, 0.0], dtype=float)
-        weight_sum = 1.0
-    weights = weights / weight_sum
-
-    score = weights[0] * voltage_rate_z + weights[1] * env_rate_z + weights[2] * wavelet_energy_z
     return {
-        "score": score,
         "env": env,
         "env_rate_z": env_rate_z,
         "voltage_rate_z": voltage_rate_z,
@@ -275,22 +277,39 @@ def expand_mask(mask: np.ndarray, radius_samples: int) -> np.ndarray:
 def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> dict[str, np.ndarray | float]:
     """计算逐采样点体动门控。
 
-    每个通道先算一个 motion score：
-    1. 原信号快速变化率，用来抓短时冲击和翻身；
-    2. 包络变化率，用来抓慢一点的姿态/接触状态变化。
-    3. 小波细节能量，用来抓非呼吸频段的短时宽带扰动。
+    先计算三个物理含义不同的特征：
+    1. PVDF+压阻电压快速变化率，用来抓短时冲击和翻身；
+    2. PVDF+压阻包络变化率，用来抓慢一点的姿态/接触状态变化；
+    3. PVDF 小波细节能量，用来抓压电材料可感知的高频/宽带扰动。
 
-    两个通道再按 pvdf_weight 加权融合，最后用 median + k*MAD 的鲁棒阈值判体动。
-    压阻通道不参与呼吸率估计，只参与这里的体动判断。
+    压阻不计算小波细节能量，避免把压阻高频电路噪声当成体动信号。
+    最后用 median + k*MAD 的鲁棒阈值判体动。
     """
-    pvdf_motion = channel_motion_score(pvdf, cfg)
-    pr_motion = channel_motion_score(pr, cfg)
-    fused = cfg.pvdf_weight * pvdf_motion["score"] + (1.0 - cfg.pvdf_weight) * pr_motion["score"]
+    pvdf_motion = channel_motion_features(pvdf, cfg, include_wavelet=True)
+    pr_motion = channel_motion_features(pr, cfg, include_wavelet=False)
+
+    weights = motion_feature_weights(cfg)
+    pvdf_w = float(np.clip(cfg.pvdf_weight, 0.0, 1.0))
+    pr_w = 1.0 - pvdf_w
+
+    voltage_score = pvdf_w * pvdf_motion["voltage_rate_z"] + pr_w * pr_motion["voltage_rate_z"]
+    envelope_score = pvdf_w * pvdf_motion["env_rate_z"] + pr_w * pr_motion["env_rate_z"]
+    wavelet_score = pvdf_motion["wavelet_energy_z"]
+
+    fused = weights[0] * voltage_score + weights[1] * envelope_score + weights[2] * wavelet_score
     fused = moving_average(fused, int(round(1.0 * cfg.fs)))
+
+    # Diagnostic channel scores; PR has no wavelet term by design.
+    pvdf_score = (
+        weights[0] * pvdf_motion["voltage_rate_z"]
+        + weights[1] * pvdf_motion["env_rate_z"]
+        + weights[2] * pvdf_motion["wavelet_energy_z"]
+    )
+    pr_score = weights[0] * pr_motion["voltage_rate_z"] + weights[1] * pr_motion["env_rate_z"]
 
     edge = int(round(cfg.edge_guard_sec * cfg.fs))
     if edge > 0 and len(fused) > 2 * edge:
-        for arr in (pvdf_motion["score"], pr_motion["score"], fused):
+        for arr in (pvdf_score, pr_score, voltage_score, envelope_score, wavelet_score, fused):
             arr[:edge] = 0.0
             arr[-edge:] = 0.0
 
@@ -300,14 +319,16 @@ def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> di
     raw_motion = fused > threshold
     motion = expand_mask(raw_motion, int(round(cfg.motion_dilate_sec * cfg.fs)))
     return {
-        "pvdf_score": pvdf_motion["score"],
-        "pr_score": pr_motion["score"],
+        "pvdf_score": pvdf_score,
+        "pr_score": pr_score,
+        "voltage_score": voltage_score,
+        "envelope_score": envelope_score,
+        "pvdf_wavelet_score": wavelet_score,
         "pvdf_voltage_rate_z": pvdf_motion["voltage_rate_z"],
         "pvdf_env_rate_z": pvdf_motion["env_rate_z"],
         "pvdf_wavelet_energy_z": pvdf_motion["wavelet_energy_z"],
         "pr_voltage_rate_z": pr_motion["voltage_rate_z"],
         "pr_env_rate_z": pr_motion["env_rate_z"],
-        "pr_wavelet_energy_z": pr_motion["wavelet_energy_z"],
         "motion_score": fused,
         "motion_threshold": float(threshold),
         "raw_motion_mask": raw_motion,
@@ -481,12 +502,14 @@ def build_window_table(
             "mean_motion_score": float(np.mean(gate["motion_score"][start:end])),
             "mean_pvdf_motion_score": float(np.mean(gate["pvdf_score"][start:end])),
             "mean_pr_motion_score": float(np.mean(gate["pr_score"][start:end])),
+            "mean_voltage_score": float(np.mean(gate["voltage_score"][start:end])),
+            "mean_envelope_score": float(np.mean(gate["envelope_score"][start:end])),
+            "mean_pvdf_wavelet_score": float(np.mean(gate["pvdf_wavelet_score"][start:end])),
             "mean_pvdf_voltage_rate_z": float(np.mean(gate["pvdf_voltage_rate_z"][start:end])),
             "mean_pvdf_env_rate_z": float(np.mean(gate["pvdf_env_rate_z"][start:end])),
             "mean_pvdf_wavelet_energy_z": float(np.mean(gate["pvdf_wavelet_energy_z"][start:end])),
             "mean_pr_voltage_rate_z": float(np.mean(gate["pr_voltage_rate_z"][start:end])),
             "mean_pr_env_rate_z": float(np.mean(gate["pr_env_rate_z"][start:end])),
-            "mean_pr_wavelet_energy_z": float(np.mean(gate["pr_wavelet_energy_z"][start:end])),
             "pvdf_rr_bpm": pvdf_feat["rr_bpm"],
             "pvdf_fft_rr_bpm": pvdf_feat["fft_rr_bpm"],
             "pvdf_resp_band_ratio": pvdf_feat["resp_band_ratio"],
@@ -720,9 +743,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-sec", type=float, default=5.0, help="Sliding-window step in seconds.")
     parser.add_argument("--motion-threshold-z", type=float, default=3.0, help="Robust z threshold for motion detection.")
     parser.add_argument("--pvdf-weight", type=float, default=0.5, help="PVDF weight in fused motion score; PR weight is 1-this.")
-    parser.add_argument("--voltage-rate-weight", type=float, default=0.40, help="Weight of smoothed voltage derivative in each channel motion score.")
-    parser.add_argument("--envelope-rate-weight", type=float, default=0.40, help="Weight of envelope derivative in each channel motion score.")
-    parser.add_argument("--wavelet-motion-weight", type=float, default=0.20, help="Weight of wavelet detail energy; set 0 for smoothing-only motion gating.")
+    parser.add_argument("--voltage-rate-weight", type=float, default=0.40, help="Weight of PVDF+PR smoothed voltage derivative in motion score.")
+    parser.add_argument("--envelope-rate-weight", type=float, default=0.40, help="Weight of PVDF+PR envelope derivative in motion score.")
+    parser.add_argument("--wavelet-motion-weight", type=float, default=0.20, help="Weight of PVDF-only wavelet detail energy; set 0 for smoothing-only motion gating.")
     parser.add_argument("--fs-raw", type=float, default=500.0, help="Raw sampling rate in Hz.")
     parser.add_argument("--downsample-q", type=int, default=10, help="Downsampling factor; 500/10 gives 50 Hz.")
     return parser.parse_args()
