@@ -49,7 +49,15 @@ class GateConfig:
     motion_threshold_z: float = 3.0
 
     # 双通道融合权重。0.5 表示 PVDF 和压阻对体动判断同等重要。
+    # 注意：压阻只用于体动门控，不再用于呼吸率估计或 SQI 的呼吸一致性惩罚。
     pvdf_weight: float = 0.5
+
+    # 单通道体动分数的三个分量权重。
+    # voltage_rate：短时电压跳变；envelope_rate：幅度/接触状态改变；
+    # wavelet_motion：非呼吸高频/宽带细节能量。可设为 0 做“只用平滑变化率”的消融。
+    voltage_rate_weight: float = 0.40
+    envelope_rate_weight: float = 0.40
+    wavelet_motion_weight: float = 0.20
 
     # 呼吸频段。0.10-0.60 Hz 对应 6-36 bpm，用于频谱质量评价和带通滤波。
     resp_low_hz: float = 0.10
@@ -193,7 +201,40 @@ def extract_pvdf_respiration(pvdf: np.ndarray, cfg: GateConfig) -> np.ndarray:
     return bandpass(resp, cfg.fs, cfg.resp_low_hz, cfg.resp_high_hz)
 
 
-def channel_motion_score(x: np.ndarray, fs: float) -> dict[str, np.ndarray]:
+def wavelet_motion_energy_z(x: np.ndarray, cfg: GateConfig) -> np.ndarray:
+    """用小波细节能量描述非呼吸瞬态扰动。
+
+    它不是用来估计呼吸，而是补充体动门控：稳定心冲击/噪声如果能量长期存在，
+    鲁棒 z 分数不会很高；翻身、碰撞、接触状态突变通常会让细节能量短时升高。
+    """
+    if cfg.wavelet_motion_weight <= 0:
+        return np.zeros_like(x, dtype=float)
+
+    if pywt is None:
+        high = x - moving_average(x, int(round(1.0 * cfg.fs)))
+    else:
+        wavelet = "db5"
+        level = min(4, pywt.dwt_max_level(len(x), pywt.Wavelet(wavelet).dec_len))
+        if level < 1:
+            high = x - moving_average(x, int(round(1.0 * cfg.fs)))
+        else:
+            coeffs = pywt.wavedec(x, wavelet=wavelet, level=level)
+            detail_coeffs = [np.zeros_like(coeffs[0])] + [c.copy() for c in coeffs[1:]]
+            high = pywt.waverec(detail_coeffs, wavelet)[: len(x)]
+
+    detail_energy = moving_average(high * high, int(round(1.0 * cfg.fs)))
+    return robust_positive_z(detail_energy)
+
+
+def channel_motion_score(x: np.ndarray, cfg: GateConfig) -> dict[str, np.ndarray]:
+    """计算单通道体动分数。
+
+    电压变化率和包络变化率有相关性，但不完全重复：
+    - 电压变化率更像“一阶导数”，对瞬时冲击敏感；
+    - 包络变化率看的是交流幅度变化，对接触状态、姿态改变更敏感；
+    - 小波细节能量看非呼吸高频/宽带瞬态，只作为弱补充。
+    """
+    fs = cfg.fs
     smooth = moving_average(x, int(round(0.3 * fs)))
     trend = moving_average(x, int(round(8.0 * fs)))
     ac = x - trend
@@ -201,12 +242,26 @@ def channel_motion_score(x: np.ndarray, fs: float) -> dict[str, np.ndarray]:
 
     env_rate_z = robust_positive_z(abs_rate(env, fs))
     voltage_rate_z = robust_positive_z(abs_rate(smooth, fs))
-    score = 0.5 * env_rate_z + 0.5 * voltage_rate_z
+    wavelet_energy_z = wavelet_motion_energy_z(x, cfg)
+
+    weights = np.array(
+        [cfg.voltage_rate_weight, cfg.envelope_rate_weight, cfg.wavelet_motion_weight],
+        dtype=float,
+    )
+    weights = np.clip(weights, 0.0, None)
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 1e-12:
+        weights = np.array([0.5, 0.5, 0.0], dtype=float)
+        weight_sum = 1.0
+    weights = weights / weight_sum
+
+    score = weights[0] * voltage_rate_z + weights[1] * env_rate_z + weights[2] * wavelet_energy_z
     return {
         "score": score,
         "env": env,
         "env_rate_z": env_rate_z,
         "voltage_rate_z": voltage_rate_z,
+        "wavelet_energy_z": wavelet_energy_z,
     }
 
 
@@ -222,12 +277,14 @@ def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> di
 
     每个通道先算一个 motion score：
     1. 原信号快速变化率，用来抓短时冲击和翻身；
-    2. 包络变化率，用来抓慢一点的姿态/压力重分布变化。
+    2. 包络变化率，用来抓慢一点的姿态/接触状态变化。
+    3. 小波细节能量，用来抓非呼吸频段的短时宽带扰动。
 
     两个通道再按 pvdf_weight 加权融合，最后用 median + k*MAD 的鲁棒阈值判体动。
+    压阻通道不参与呼吸率估计，只参与这里的体动判断。
     """
-    pvdf_motion = channel_motion_score(pvdf, cfg.fs)
-    pr_motion = channel_motion_score(pr, cfg.fs)
+    pvdf_motion = channel_motion_score(pvdf, cfg)
+    pr_motion = channel_motion_score(pr, cfg)
     fused = cfg.pvdf_weight * pvdf_motion["score"] + (1.0 - cfg.pvdf_weight) * pr_motion["score"]
     fused = moving_average(fused, int(round(1.0 * cfg.fs)))
 
@@ -245,6 +302,12 @@ def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> di
     return {
         "pvdf_score": pvdf_motion["score"],
         "pr_score": pr_motion["score"],
+        "pvdf_voltage_rate_z": pvdf_motion["voltage_rate_z"],
+        "pvdf_env_rate_z": pvdf_motion["env_rate_z"],
+        "pvdf_wavelet_energy_z": pvdf_motion["wavelet_energy_z"],
+        "pr_voltage_rate_z": pr_motion["voltage_rate_z"],
+        "pr_env_rate_z": pr_motion["env_rate_z"],
+        "pr_wavelet_energy_z": pr_motion["wavelet_energy_z"],
         "motion_score": fused,
         "motion_threshold": float(threshold),
         "raw_motion_mask": raw_motion,
@@ -343,7 +406,7 @@ def iter_windows(n: int, cfg: GateConfig) -> list[tuple[int, int]]:
 def classify_window(row: dict[str, float], cfg: GateConfig) -> tuple[str, bool, float]:
     """把一个 30 s 窗口的特征转换成 label、pass_gate 和 SQI。
 
-    SQI 的思路是“先给基础分，再奖励稳定呼吸特征，最后扣除体动/坏点/双通道不一致”。
+    SQI 的思路是“先给基础分，再奖励 PVDF 稳定呼吸特征，最后扣除体动/坏点”。
     当前公式：
 
         SQI = 50
@@ -352,10 +415,10 @@ def classify_window(row: dict[str, float], cfg: GateConfig) -> tuple[str, bool, 
               + 呼吸峰间期稳定性奖励，最多 +10
               - 体动占比惩罚，最多按 80 * motion_fraction 扣
               - 坏点占比惩罚，最多按 120 * bad_fraction 扣
-              - PVDF/压阻呼吸率不一致惩罚，最多扣 20
 
     最后把 SQI 限制在 0-100。分类不是只看 SQI：先用硬规则判 invalid/motion/
     low_quality/usable/good，再要求 good 或 usable 且 SQI >= min_pass_quality 才通过。
+    压阻不参与这里的呼吸质量评分，因为当前硬件是平行双通道，不是压力分布阵列。
     """
     rr_ok = np.isfinite(row["pvdf_rr_bpm"]) and cfg.rr_min_bpm <= row["pvdf_rr_bpm"] <= cfg.rr_max_bpm
 
@@ -367,9 +430,6 @@ def classify_window(row: dict[str, float], cfg: GateConfig) -> tuple[str, bool, 
 
     motion_penalty = 80.0 * row["motion_fraction"]
     bad_penalty = 120.0 * row["bad_fraction"]
-    rr_disagreement_penalty = 0.0
-    if np.isfinite(row["rr_abs_diff_bpm"]):
-        rr_disagreement_penalty = min(20.0, 1.5 * row["rr_abs_diff_bpm"])
 
     quality = (
         50.0
@@ -378,7 +438,6 @@ def classify_window(row: dict[str, float], cfg: GateConfig) -> tuple[str, bool, 
         + stability_bonus
         - motion_penalty
         - bad_penalty
-        - rr_disagreement_penalty
     )
     quality = float(np.clip(quality, 0.0, 100.0))
 
@@ -413,16 +472,6 @@ def build_window_table(
     rows: list[dict[str, float | str | bool]] = []
     for start, end in iter_windows(len(data["t"]), cfg):
         pvdf_feat = respiration_features(resp[start:end], cfg)
-        pr_resp = bandpass(data["pr"][start:end], cfg.fs, cfg.resp_low_hz, cfg.resp_high_hz)
-        pr_feat = respiration_features(pr_resp, cfg)
-
-        rr_abs_diff = np.nan
-        if (
-            np.isfinite(pvdf_feat["rr_bpm"])
-            and np.isfinite(pr_feat["rr_bpm"])
-            and pr_feat["resp_band_ratio"] >= 0.15
-        ):
-            rr_abs_diff = abs(pvdf_feat["rr_bpm"] - pr_feat["rr_bpm"])
 
         row: dict[str, float | str | bool] = {
             "start_sec": float(data["t"][start]),
@@ -430,6 +479,14 @@ def build_window_table(
             "bad_fraction": float(np.mean(data["bad_fraction"][start:end])),
             "motion_fraction": float(np.mean(gate["motion_mask"][start:end])),
             "mean_motion_score": float(np.mean(gate["motion_score"][start:end])),
+            "mean_pvdf_motion_score": float(np.mean(gate["pvdf_score"][start:end])),
+            "mean_pr_motion_score": float(np.mean(gate["pr_score"][start:end])),
+            "mean_pvdf_voltage_rate_z": float(np.mean(gate["pvdf_voltage_rate_z"][start:end])),
+            "mean_pvdf_env_rate_z": float(np.mean(gate["pvdf_env_rate_z"][start:end])),
+            "mean_pvdf_wavelet_energy_z": float(np.mean(gate["pvdf_wavelet_energy_z"][start:end])),
+            "mean_pr_voltage_rate_z": float(np.mean(gate["pr_voltage_rate_z"][start:end])),
+            "mean_pr_env_rate_z": float(np.mean(gate["pr_env_rate_z"][start:end])),
+            "mean_pr_wavelet_energy_z": float(np.mean(gate["pr_wavelet_energy_z"][start:end])),
             "pvdf_rr_bpm": pvdf_feat["rr_bpm"],
             "pvdf_fft_rr_bpm": pvdf_feat["fft_rr_bpm"],
             "pvdf_resp_band_ratio": pvdf_feat["resp_band_ratio"],
@@ -437,14 +494,6 @@ def build_window_table(
             "pvdf_peak_count": pvdf_feat["peak_count"],
             "pvdf_ibi_cv": pvdf_feat["ibi_cv"],
             "pvdf_rr_method_peak": pvdf_feat["rr_method_peak"],
-            "pr_rr_bpm": pr_feat["rr_bpm"],
-            "pr_fft_rr_bpm": pr_feat["fft_rr_bpm"],
-            "pr_resp_band_ratio": pr_feat["resp_band_ratio"],
-            "pr_dominance": pr_feat["dominance"],
-            "pr_peak_count": pr_feat["peak_count"],
-            "pr_ibi_cv": pr_feat["ibi_cv"],
-            "pr_rr_method_peak": pr_feat["rr_method_peak"],
-            "rr_abs_diff_bpm": rr_abs_diff,
         }
         label, pass_gate, quality = classify_window(row, cfg)
         row["label"] = label
@@ -671,6 +720,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-sec", type=float, default=5.0, help="Sliding-window step in seconds.")
     parser.add_argument("--motion-threshold-z", type=float, default=3.0, help="Robust z threshold for motion detection.")
     parser.add_argument("--pvdf-weight", type=float, default=0.5, help="PVDF weight in fused motion score; PR weight is 1-this.")
+    parser.add_argument("--voltage-rate-weight", type=float, default=0.40, help="Weight of smoothed voltage derivative in each channel motion score.")
+    parser.add_argument("--envelope-rate-weight", type=float, default=0.40, help="Weight of envelope derivative in each channel motion score.")
+    parser.add_argument("--wavelet-motion-weight", type=float, default=0.20, help="Weight of wavelet detail energy; set 0 for smoothing-only motion gating.")
     parser.add_argument("--fs-raw", type=float, default=500.0, help="Raw sampling rate in Hz.")
     parser.add_argument("--downsample-q", type=int, default=10, help="Downsampling factor; 500/10 gives 50 Hz.")
     return parser.parse_args()
@@ -685,6 +737,9 @@ def main() -> None:
         step_sec=args.step_sec,
         motion_threshold_z=args.motion_threshold_z,
         pvdf_weight=args.pvdf_weight,
+        voltage_rate_weight=args.voltage_rate_weight,
+        envelope_rate_weight=args.envelope_rate_weight,
+        wavelet_motion_weight=args.wavelet_motion_weight,
     )
 
     csv_paths = resolve_inputs(args.input)
