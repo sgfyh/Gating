@@ -83,6 +83,13 @@ class GateConfig:
     min_resp_band_ratio: float = 0.35    # 呼吸频带能量占比低于 35%，窗口判 low_quality。
     min_pass_quality: float = 60.0       # SQI 低于 60，即使标签可用也不通过门控。
 
+    # 体动分段和事件候选参数。这里输出的是候选事件，不是临床诊断结论。
+    min_quiet_segment_sec: float = 10.0  # 两次体动之间少于 10 s，不够判事件，跳过。
+    min_event_sec: float = 10.0          # 呼吸暂停/低通气候选的最短持续时间。
+    apnea_drop_fraction: float = 0.90    # 相对基线振幅下降 >=90%，偏向暂停候选。
+    hypopnea_drop_fraction: float = 0.30 # 相对基线振幅下降 >=30%，偏向低通气候选。
+    baseline_min_frames: int = 5         # 建基线至少希望有多少个正常呼吸帧。
+
     @property
     def fs(self) -> float:
         return self.fs_raw / self.downsample_q
@@ -527,6 +534,285 @@ def build_window_table(
     return pd.DataFrame(rows)
 
 
+def build_quiet_segments(gate: dict[str, np.ndarray | float], cfg: GateConfig) -> pd.DataFrame:
+    """把逐点体动掩码转换成安静段。
+
+    安静段是两次体动之间的连续非体动区间。它是后续呼吸率时间序列和事件候选
+    检测的基本单位，避免固定 30 s 窗口把一个暂停事件切碎。
+    """
+    motion = np.asarray(gate["motion_mask"], dtype=bool)
+    quiet = ~motion
+    rows: list[dict[str, int | float | bool]] = []
+    start = None
+    segment_id = 0
+    for i, is_quiet in enumerate(quiet):
+        if is_quiet and start is None:
+            start = i
+        elif (not is_quiet) and start is not None:
+            end = i
+            duration = (end - start) / cfg.fs
+            rows.append(
+                {
+                    "segment_id": segment_id,
+                    "start_idx": int(start),
+                    "end_idx": int(end),
+                    "start_sec": float(start / cfg.fs),
+                    "end_sec": float(end / cfg.fs),
+                    "duration_sec": float(duration),
+                    "analyzable": bool(duration >= cfg.min_quiet_segment_sec),
+                }
+            )
+            segment_id += 1
+            start = None
+
+    if start is not None:
+        end = len(quiet)
+        duration = (end - start) / cfg.fs
+        rows.append(
+            {
+                "segment_id": segment_id,
+                "start_idx": int(start),
+                "end_idx": int(end),
+                "start_sec": float(start / cfg.fs),
+                "end_sec": float(end / cfg.fs),
+                "duration_sec": float(duration),
+                "analyzable": bool(duration >= cfg.min_quiet_segment_sec),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def attach_window_segments(windows: pd.DataFrame, segments: pd.DataFrame) -> pd.DataFrame:
+    if windows.empty:
+        return windows
+    out = windows.copy()
+    out["segment_id"] = -1
+    out["segment_duration_sec"] = np.nan
+    if segments.empty:
+        return out
+
+    centers = 0.5 * (out["start_sec"].to_numpy() + out["end_sec"].to_numpy())
+    for seg in segments.itertuples(index=False):
+        mask = (centers >= seg.start_sec) & (centers < seg.end_sec) & bool(seg.analyzable)
+        out.loc[mask, "segment_id"] = int(seg.segment_id)
+        out.loc[mask, "segment_duration_sec"] = float(seg.duration_sec)
+    return out
+
+
+def window_quality_at_time(windows: pd.DataFrame, time_sec: float) -> tuple[float, bool]:
+    if windows.empty:
+        return np.nan, False
+    mask = (windows["start_sec"] <= time_sec) & (time_sec <= windows["end_sec"])
+    if not mask.any():
+        return np.nan, False
+    local = windows.loc[mask]
+    return float(local["quality_score"].max()), bool(local["pass_gate"].any())
+
+
+def build_breath_frames(resp: np.ndarray, segments: pd.DataFrame, windows: pd.DataFrame, cfg: GateConfig) -> pd.DataFrame:
+    """在安静段内按谷到谷建立呼吸帧。
+
+    这里不使用 FFT 兜底。事件检测语境下“找不到可靠谷”本身就是信号异常线索，
+    不应为了给出呼吸率而强行凑数。
+    """
+    rows: list[dict[str, float | int | bool]] = []
+    if segments.empty:
+        return pd.DataFrame(rows)
+
+    min_distance = max(1, int(round(cfg.resp_peak_min_dist_sec * cfg.fs)))
+    for seg in segments.itertuples(index=False):
+        if not bool(seg.analyzable):
+            continue
+        start = int(seg.start_idx)
+        end = int(seg.end_idx)
+        x = np.asarray(resp[start:end], dtype=float)
+        if len(x) < max(3, min_distance):
+            continue
+        x = signal.detrend(x, type="linear")
+        amp_range = float(np.nanpercentile(x, 95) - np.nanpercentile(x, 5))
+        if amp_range <= 1e-12:
+            continue
+        prominence = cfg.resp_peak_prom_ratio * amp_range
+        valleys, props = signal.find_peaks(-x, distance=min_distance, prominence=prominence)
+        if len(valleys) < 2:
+            continue
+
+        abs_valleys = valleys + start
+        prominences = props.get("prominences", np.full(len(valleys), np.nan))
+        for i in range(len(abs_valleys) - 1):
+            frame_start = int(abs_valleys[i])
+            frame_end = int(abs_valleys[i + 1])
+            if frame_end <= frame_start:
+                continue
+            y = resp[frame_start : frame_end + 1]
+            duration = (frame_end - frame_start) / cfg.fs
+            amplitude = float(np.nanmax(y) - np.nanmin(y)) if len(y) else np.nan
+            center_sec = 0.5 * (frame_start + frame_end) / cfg.fs
+            quality, in_pass_window = window_quality_at_time(windows, center_sec)
+            rows.append(
+                {
+                    "segment_id": int(seg.segment_id),
+                    "frame_index": int(len(rows)),
+                    "start_sec": float(frame_start / cfg.fs),
+                    "end_sec": float(frame_end / cfg.fs),
+                    "center_sec": float(center_sec),
+                    "duration_sec": float(duration),
+                    "rr_bpm": float(60.0 / duration) if duration > 0 else np.nan,
+                    "amplitude": amplitude,
+                    "left_valley_prominence": float(prominences[i]) if i < len(prominences) else np.nan,
+                    "window_quality_score": quality,
+                    "in_pass_window": in_pass_window,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def estimate_baseline(frames: pd.DataFrame, windows: pd.DataFrame, cfg: GateConfig) -> dict[str, object]:
+    normal_min = 60.0 / cfg.rr_max_bpm
+    normal_max = cfg.min_event_sec
+    if frames.empty:
+        return {
+            "baseline_rr_bpm": None,
+            "baseline_amplitude": None,
+            "baseline_frame_count": 0,
+            "baseline_source": "none",
+        }
+
+    base = frames[
+        (frames["duration_sec"] >= normal_min)
+        & (frames["duration_sec"] < normal_max)
+        & np.isfinite(frames["amplitude"])
+        & (frames["amplitude"] > 0)
+        & (frames["in_pass_window"])
+    ].copy()
+    source = "pass_gate_frames"
+    if len(base) < cfg.baseline_min_frames:
+        base = frames[
+            (frames["duration_sec"] >= normal_min)
+            & (frames["duration_sec"] < normal_max)
+            & np.isfinite(frames["amplitude"])
+            & (frames["amplitude"] > 0)
+        ].copy()
+        source = "all_normal_duration_frames"
+
+    if base.empty:
+        return {
+            "baseline_rr_bpm": None,
+            "baseline_amplitude": None,
+            "baseline_frame_count": 0,
+            "baseline_source": "none",
+        }
+
+    if "window_quality_score" in base.columns:
+        base = base.sort_values("window_quality_score", ascending=False)
+        top_n = max(cfg.baseline_min_frames, int(np.ceil(0.3 * len(base))))
+        base = base.head(top_n)
+
+    return {
+        "baseline_rr_bpm": float(base["rr_bpm"].median()),
+        "baseline_amplitude": float(base["amplitude"].median()),
+        "baseline_frame_count": int(len(base)),
+        "baseline_source": source,
+    }
+
+
+def merge_frame_events(frames: pd.DataFrame, mask: np.ndarray, event_type: str, cfg: GateConfig) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    current: list[pd.Series] = []
+    for i, (_, row) in enumerate(frames.iterrows()):
+        is_event = bool(mask[i])
+        if is_event:
+            current.append(row)
+        elif current:
+            events.extend(summarize_frame_group(current, event_type, cfg))
+            current = []
+    if current:
+        events.extend(summarize_frame_group(current, event_type, cfg))
+    return events
+
+
+def summarize_frame_group(group: list[pd.Series], event_type: str, cfg: GateConfig) -> list[dict[str, object]]:
+    start_sec = float(group[0]["start_sec"])
+    end_sec = float(group[-1]["end_sec"])
+    duration = end_sec - start_sec
+    if duration < cfg.min_event_sec:
+        return []
+    amp_ratio = float(np.nanmedian([g.get("amplitude_ratio", np.nan) for g in group]))
+    return [
+        {
+            "segment_id": int(group[0]["segment_id"]),
+            "event_type": event_type,
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "duration_sec": float(duration),
+            "frame_count": int(len(group)),
+            "median_amplitude_ratio": amp_ratio,
+            "min_rr_bpm": float(np.nanmin([g["rr_bpm"] for g in group])),
+            "rule": "consecutive_low_amplitude_frames",
+        }
+    ]
+
+
+def detect_event_candidates(frames: pd.DataFrame, segments: pd.DataFrame, baseline: dict[str, object], cfg: GateConfig) -> pd.DataFrame:
+    event_columns = [
+        "segment_id",
+        "event_type",
+        "start_sec",
+        "end_sec",
+        "duration_sec",
+        "frame_count",
+        "median_amplitude_ratio",
+        "min_rr_bpm",
+        "rule",
+    ]
+    rows: list[dict[str, object]] = []
+    baseline_amp = baseline.get("baseline_amplitude")
+    if frames.empty or baseline_amp is None or not np.isfinite(float(baseline_amp)) or float(baseline_amp) <= 0:
+        return pd.DataFrame(rows, columns=event_columns)
+
+    out_frames = frames.copy()
+    out_frames["amplitude_ratio"] = out_frames["amplitude"] / float(baseline_amp)
+    apnea_ratio = 1.0 - cfg.apnea_drop_fraction
+    hypopnea_ratio = 1.0 - cfg.hypopnea_drop_fraction
+
+    for _, row in out_frames.iterrows():
+        if row["duration_sec"] >= cfg.min_event_sec:
+            ratio = float(row["amplitude_ratio"])
+            event_type = "apnea_gap_candidate" if ratio <= hypopnea_ratio else "long_interval_candidate"
+            rows.append(
+                {
+                    "segment_id": int(row["segment_id"]),
+                    "event_type": event_type,
+                    "start_sec": float(row["start_sec"]),
+                    "end_sec": float(row["end_sec"]),
+                    "duration_sec": float(row["duration_sec"]),
+                    "frame_count": 1,
+                    "median_amplitude_ratio": ratio,
+                    "min_rr_bpm": float(row["rr_bpm"]),
+                    "rule": "valley_interval_ge_min_event_sec",
+                }
+            )
+
+    for segment_id, group in out_frames.groupby("segment_id"):
+        group = group.sort_values("start_sec").copy()
+        apnea_mask = (group["amplitude_ratio"].to_numpy() <= apnea_ratio) & (group["duration_sec"].to_numpy() < cfg.min_event_sec)
+        hypopnea_mask = (
+            (group["amplitude_ratio"].to_numpy() <= hypopnea_ratio)
+            & (group["amplitude_ratio"].to_numpy() > apnea_ratio)
+            & (group["duration_sec"].to_numpy() < cfg.min_event_sec)
+        )
+        rows.extend(merge_frame_events(group, apnea_mask, "apnea_low_amplitude_candidate", cfg))
+        rows.extend(merge_frame_events(group, hypopnea_mask, "hypopnea_candidate", cfg))
+
+    return (
+        pd.DataFrame(rows, columns=event_columns).sort_values(["start_sec", "end_sec"]).reset_index(drop=True)
+        if rows
+        else pd.DataFrame(rows, columns=event_columns)
+    )
+
+
 def normalized_for_plot(x: np.ndarray) -> np.ndarray:
     med = np.nanmedian(x)
     lo, hi = np.nanpercentile(x, [5, 95])
@@ -653,14 +939,79 @@ def plot_detail(
     plt.close(fig)
 
 
+def plot_event_overview(
+    out_path: Path,
+    data: dict[str, np.ndarray],
+    resp: np.ndarray,
+    gate: dict[str, np.ndarray | float],
+    segments: pd.DataFrame,
+    events: pd.DataFrame,
+    cfg: GateConfig,
+) -> None:
+    t = data["t"]
+    max_points = 40000
+    stride = max(1, int(np.ceil(len(t) / max_points)))
+    sl = slice(None, None, stride)
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 7), sharex=True)
+    axes[0].plot(t[sl], normalized_for_plot(resp)[sl], linewidth=0.8, label="PVDF respiration")
+    axes[0].set_ylabel("resp.")
+    axes[0].legend(loc="upper right")
+
+    axes[1].plot(t[sl], gate["motion_score"][sl], color="tab:red", linewidth=0.8, label="motion score")
+    axes[1].axhline(gate["motion_threshold"], color="black", linestyle="--", linewidth=1.0)
+    axes[1].set_ylabel("motion")
+    axes[1].legend(loc="upper right")
+
+    if not segments.empty:
+        for seg in segments.itertuples(index=False):
+            if bool(seg.analyzable):
+                axes[2].axvspan(seg.start_sec, seg.end_sec, color="tab:blue", alpha=0.08, linewidth=0)
+
+    event_colors = {
+        "apnea_gap_candidate": "tab:red",
+        "apnea_low_amplitude_candidate": "tab:purple",
+        "hypopnea_candidate": "tab:orange",
+        "long_interval_candidate": "tab:brown",
+    }
+    if not events.empty:
+        for event in events.itertuples(index=False):
+            color = event_colors.get(event.event_type, "tab:gray")
+            axes[0].axvspan(event.start_sec, event.end_sec, color=color, alpha=0.18, linewidth=0)
+            axes[2].axvspan(event.start_sec, event.end_sec, color=color, alpha=0.50, linewidth=0)
+            axes[2].text(
+                0.5 * (event.start_sec + event.end_sec),
+                0.5,
+                str(event.event_type).replace("_candidate", ""),
+                ha="center",
+                va="center",
+                fontsize=8,
+                rotation=0,
+            )
+
+    axes[2].set_ylim(0, 1)
+    axes[2].set_yticks([])
+    axes[2].set_ylabel("events")
+    axes[2].set_xlabel("Time (s)")
+    fig.suptitle("Quiet segments and respiratory event candidates", y=0.995)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def make_summary(
     csv_path: Path,
     data: dict[str, np.ndarray],
     gate: dict[str, np.ndarray | float],
     windows: pd.DataFrame,
+    segments: pd.DataFrame,
+    frames: pd.DataFrame,
+    events: pd.DataFrame,
+    baseline: dict[str, object],
     cfg: GateConfig,
 ) -> dict[str, object]:
     passed = windows[windows["pass_gate"]]
+    analyzable_segments = segments[segments["analyzable"]] if not segments.empty else segments
     return {
         "input_csv": str(csv_path),
         "fs_raw": cfg.fs_raw,
@@ -679,6 +1030,12 @@ def make_summary(
         "median_rr_bpm_passed": float(passed["pvdf_rr_bpm"].median()) if len(passed) else None,
         "median_quality_passed": float(passed["quality_score"].median()) if len(passed) else None,
         "label_counts": windows["label"].value_counts().to_dict(),
+        "quiet_segments_total": int(len(segments)),
+        "quiet_segments_analyzable": int(len(analyzable_segments)),
+        "breath_frames_total": int(len(frames)),
+        "event_candidates_total": int(len(events)),
+        "event_type_counts": events["event_type"].value_counts().to_dict() if len(events) else {},
+        "baseline": baseline,
         "config": asdict(cfg),
     }
 
@@ -694,7 +1051,12 @@ def write_text_summary(path: Path, summary: dict[str, object]) -> None:
         f"Passed windows: {summary['windows_passed']} / {summary['windows_total']}",
         f"Median RR in passed windows: {summary['median_rr_bpm_passed']}",
         f"Median SQI in passed windows: {summary['median_quality_passed']}",
+        f"Analyzable quiet segments: {summary['quiet_segments_analyzable']} / {summary['quiet_segments_total']}",
+        f"Breath frames: {summary['breath_frames_total']}",
+        f"Event candidates: {summary['event_candidates_total']}",
+        f"Baseline: {summary['baseline']}",
         f"Label counts: {summary['label_counts']}",
+        f"Event type counts: {summary['event_type_counts']}",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -704,27 +1066,50 @@ def analyze_csv(csv_path: Path, out_dir: Path, cfg: GateConfig) -> dict[str, obj
     data = load_dual_channel_csv(csv_path, cfg)
     resp = extract_pvdf_respiration(data["pvdf"], cfg)
     gate = compute_motion_gate(data["pvdf"], data["pr"], cfg)
-    windows = build_window_table(data, resp, gate, cfg)
+    segments = build_quiet_segments(gate, cfg)
+    windows = attach_window_segments(build_window_table(data, resp, gate, cfg), segments)
+    frames = build_breath_frames(resp, segments, windows, cfg)
+    baseline = estimate_baseline(frames, windows, cfg)
+    baseline_amp = baseline.get("baseline_amplitude")
+    if len(frames) and baseline_amp is not None and np.isfinite(float(baseline_amp)) and float(baseline_amp) > 0:
+        frames = frames.copy()
+        frames["amplitude_ratio_to_baseline"] = frames["amplitude"] / float(baseline_amp)
+    events = detect_event_candidates(frames, segments, baseline, cfg)
 
     windows_path = out_dir / "quality_windows.csv"
+    segments_path = out_dir / "quiet_segments.csv"
+    frames_path = out_dir / "breath_frames.csv"
+    events_path = out_dir / "event_candidates.csv"
+    baseline_path = out_dir / "baseline.json"
     summary_json_path = out_dir / "summary.json"
     summary_txt_path = out_dir / "summary.txt"
     figure_path = out_dir / "quality_gating_overview.png"
     detail_figure_path = out_dir / "quality_gating_detail.png"
+    event_figure_path = out_dir / "event_candidates_overview.png"
 
     windows.to_csv(windows_path, index=False, encoding="utf-8-sig")
-    summary = make_summary(csv_path, data, gate, windows, cfg)
+    segments.to_csv(segments_path, index=False, encoding="utf-8-sig")
+    frames.to_csv(frames_path, index=False, encoding="utf-8-sig")
+    events.to_csv(events_path, index=False, encoding="utf-8-sig")
+    baseline_path.write_text(json.dumps(baseline, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary = make_summary(csv_path, data, gate, windows, segments, frames, events, baseline, cfg)
     summary_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     write_text_summary(summary_txt_path, summary)
     plot_overview(figure_path, data, resp, gate, windows, cfg)
     plot_detail(detail_figure_path, data, resp, gate, windows, cfg)
+    plot_event_overview(event_figure_path, data, resp, gate, segments, events, cfg)
 
     summary["outputs"] = {
         "windows_csv": str(windows_path),
+        "quiet_segments_csv": str(segments_path),
+        "breath_frames_csv": str(frames_path),
+        "event_candidates_csv": str(events_path),
+        "baseline_json": str(baseline_path),
         "summary_json": str(summary_json_path),
         "summary_txt": str(summary_txt_path),
         "overview_png": str(figure_path),
         "detail_png": str(detail_figure_path),
+        "event_overview_png": str(event_figure_path),
     }
     return summary
 
@@ -746,6 +1131,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voltage-rate-weight", type=float, default=0.40, help="Weight of PVDF+PR smoothed voltage derivative in motion score.")
     parser.add_argument("--envelope-rate-weight", type=float, default=0.40, help="Weight of PVDF+PR envelope derivative in motion score.")
     parser.add_argument("--wavelet-motion-weight", type=float, default=0.20, help="Weight of PVDF-only wavelet detail energy; set 0 for smoothing-only motion gating.")
+    parser.add_argument("--min-quiet-segment-sec", type=float, default=10.0, help="Quiet segments shorter than this are not analyzed for events.")
+    parser.add_argument("--min-event-sec", type=float, default=10.0, help="Minimum duration for apnea/hypopnea event candidates.")
+    parser.add_argument("--apnea-drop-fraction", type=float, default=0.90, help="Amplitude drop fraction for apnea-like candidates.")
+    parser.add_argument("--hypopnea-drop-fraction", type=float, default=0.30, help="Amplitude drop fraction for hypopnea-like candidates.")
     parser.add_argument("--fs-raw", type=float, default=500.0, help="Raw sampling rate in Hz.")
     parser.add_argument("--downsample-q", type=int, default=10, help="Downsampling factor; 500/10 gives 50 Hz.")
     return parser.parse_args()
@@ -763,6 +1152,10 @@ def main() -> None:
         voltage_rate_weight=args.voltage_rate_weight,
         envelope_rate_weight=args.envelope_rate_weight,
         wavelet_motion_weight=args.wavelet_motion_weight,
+        min_quiet_segment_sec=args.min_quiet_segment_sec,
+        min_event_sec=args.min_event_sec,
+        apnea_drop_fraction=args.apnea_drop_fraction,
+        hypopnea_drop_fraction=args.hypopnea_drop_fraction,
     )
 
     csv_paths = resolve_inputs(args.input)
@@ -792,6 +1185,9 @@ def main() -> None:
                     "windows_total": item["windows_total"],
                     "median_rr_bpm_passed": item["median_rr_bpm_passed"],
                     "median_quality_passed": item["median_quality_passed"],
+                    "quiet_segments_analyzable": item["quiet_segments_analyzable"],
+                    "breath_frames_total": item["breath_frames_total"],
+                    "event_candidates_total": item["event_candidates_total"],
                 }
             )
         brief_path = args.out_dir / "batch_summary.csv"

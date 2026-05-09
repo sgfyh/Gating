@@ -767,10 +767,15 @@ pass_gate = (label in {good, usable}) and (SQI >= 60)
 单文件分析输出：
 
 - `quality_windows.csv`：窗口级结果表。
+- `quiet_segments.csv`：由体动掩码切出的安静段。
+- `breath_frames.csv`：安静段内谷到谷呼吸帧，包含逐帧 RR、振幅和相对基线振幅。
+- `baseline.json`：用高 SQI 正常呼吸帧建立的正常 RR 和振幅基线。
+- `event_candidates.csv`：基于谷间间隔和振幅下降的事件候选。
 - `summary.json`：完整摘要、配置参数和输出路径。
 - `summary.txt`：简版摘要。
 - `quality_gating_overview.png`：全段总览图。
 - `quality_gating_detail.png`：最强体动附近局部图。
+- `event_candidates_overview.png`：安静段和事件候选总览图。
 
 批量分析额外输出：
 
@@ -800,7 +805,69 @@ pass_gate = (label in {good, usable}) and (SQI >= 60)
 - `pass_gate`：是否通过门控。
 - `quality_score`：SQI 分数。
 
-## 20. 当前结果如何解释
+## 20. 体动分段与双线分析
+
+新版架构不再把 SQI 作为唯一核心输出，而是先做体动分段：
+
+```text
+motion_mask -> quiet_segments
+```
+
+每个安静段定义为两次体动之间的连续非体动区间。如果段长小于：
+
+```text
+min_quiet_segment_sec = 10 s
+```
+
+则该段不参与呼吸事件分析，因为它短于最小事件持续时间。
+
+安静段内不使用固定 30 s 窗口做事件检测，而是使用谷到谷呼吸帧：
+
+```text
+valley_i -> valley_{i+1}
+```
+
+每个呼吸帧输出：
+
+- `duration_sec`：谷间间隔；
+- `rr_bpm = 60 / duration_sec`；
+- `amplitude`：该帧内 PVDF 呼吸波形的峰谷振幅；
+- `amplitude_ratio_to_baseline`：相对正常振幅基线的比例。
+
+SQI 在新版里的角色是建基线。程序优先选取：
+
+```text
+pass_gate=True 且呼吸周期 < min_event_sec 的呼吸帧
+```
+
+用这些帧的中位 RR 和中位振幅得到：
+
+```text
+baseline_rr_bpm
+baseline_amplitude
+```
+
+事件候选规则：
+
+```text
+谷间间隔 >= min_event_sec
+    -> long_interval_candidate 或 apnea_gap_candidate
+
+连续低振幅帧累计 >= min_event_sec
+    -> hypopnea_candidate 或 apnea_low_amplitude_candidate
+```
+
+默认阈值：
+
+```text
+min_event_sec = 10 s
+hypopnea_drop_fraction = 0.30
+apnea_drop_fraction = 0.90
+```
+
+也就是说，振幅低于基线 70% 持续至少 10 s，是低通气候选；振幅低于基线 10% 持续至少 10 s，是低振幅暂停候选。
+
+## 21. 当前结果如何解释
 
 已批量处理：
 
@@ -811,7 +878,7 @@ F:\双通道睡眠实验\2026_0413晚\数据
 输出目录：
 
 ```text
-outputs\2026_0413_night_feature_fusion
+outputs\2026_0413_night_dualline
 ```
 
 整晚结果：
@@ -820,12 +887,18 @@ outputs\2026_0413_night_feature_fusion
 - 加权窗口通过率约 77.50%。
 - 加权体动占比约 14.45%。
 - 单文件通过窗口中位呼吸率的中位数约 14.12 bpm。
+- 可分析安静段总数 348。
+- 谷到谷呼吸帧总数 6527。
+- 规则事件候选总数 131。
 
 稳定片段 `20260414_033313.csv`：
 
 - 窗口通过率 97.46%。
 - 体动占比 3.39%。
 - 通过窗口中位呼吸率 13.73 bpm。
+- 可分析安静段 8 个。
+- 谷到谷呼吸帧 388 个。
+- 规则事件候选 1 个。
 
 体动较多片段：
 
@@ -834,7 +907,7 @@ outputs\2026_0413_night_feature_fusion
 
 这说明当前门控至少具备一个重要性质：它能区分稳定片段和体动较多片段。正式论文里仍需要人工标注或参考设备来证明 precision、recall 和呼吸率误差改善。
 
-## 21. 可以让 ChatGPT 继续想的方向
+## 22. 可以让 ChatGPT 继续想的方向
 
 把这份文档发给网页版 ChatGPT 后，可以重点让它围绕以下问题想 idea：
 
