@@ -6,9 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import matplotlib
-
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -58,6 +56,7 @@ class GateConfig:
     voltage_rate_weight: float = 0.40
     envelope_rate_weight: float = 0.40
     wavelet_motion_weight: float = 0.20
+    wavelet_z_cap: float = 5.0
 
     # 呼吸频段。0.10-0.60 Hz 对应 6-36 bpm，用于频谱质量评价和带通滤波。
     resp_low_hz: float = 0.10
@@ -242,7 +241,10 @@ def wavelet_motion_energy_z(x: np.ndarray, cfg: GateConfig) -> np.ndarray:
             high = pywt.waverec(detail_coeffs, wavelet)[: len(x)]
 
     detail_energy = moving_average(high * high, int(round(1.0 * cfg.fs)))
-    return robust_positive_z(detail_energy)
+    z = robust_positive_z(detail_energy)
+    if cfg.wavelet_z_cap > 0:
+        z = np.minimum(z, cfg.wavelet_z_cap)
+    return z
 
 
 def channel_motion_features(x: np.ndarray, cfg: GateConfig, *, include_wavelet: bool) -> dict[str, np.ndarray]:
@@ -1131,6 +1133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voltage-rate-weight", type=float, default=0.40, help="Weight of PVDF+PR smoothed voltage derivative in motion score.")
     parser.add_argument("--envelope-rate-weight", type=float, default=0.40, help="Weight of PVDF+PR envelope derivative in motion score.")
     parser.add_argument("--wavelet-motion-weight", type=float, default=0.20, help="Weight of PVDF-only wavelet detail energy; set 0 for smoothing-only motion gating.")
+    parser.add_argument("--wavelet-z-cap", type=float, default=5.0, help="Cap PVDF-only wavelet z-score contribution; <=0 disables the cap.")
     parser.add_argument("--min-quiet-segment-sec", type=float, default=10.0, help="Quiet segments shorter than this are not analyzed for events.")
     parser.add_argument("--min-event-sec", type=float, default=10.0, help="Minimum duration for apnea/hypopnea event candidates.")
     parser.add_argument("--apnea-drop-fraction", type=float, default=0.90, help="Amplitude drop fraction for apnea-like candidates.")
@@ -1152,6 +1155,7 @@ def main() -> None:
         voltage_rate_weight=args.voltage_rate_weight,
         envelope_rate_weight=args.envelope_rate_weight,
         wavelet_motion_weight=args.wavelet_motion_weight,
+        wavelet_z_cap=args.wavelet_z_cap,
         min_quiet_segment_sec=args.min_quiet_segment_sec,
         min_event_sec=args.min_event_sec,
         apnea_drop_fraction=args.apnea_drop_fraction,

@@ -105,6 +105,36 @@ SQI 的底层特征在新架构里的去向：
 
 ---
 
+## 小波能量 z-score 放大导致误判体动
+
+**现象**：500s 附近被标记为体动，但 PVDF 呼吸波形肉眼无明显扰动，PR 通道纹丝不动。
+
+**实测数据**：
+```
+体动触发点 501.64-502.12s（仅 0.48s），膨胀后覆盖 499.64-504.12s
+
+三分量在该段:
+  wavelet_score  = 13.25   ← 唯一过阈值的分量
+  voltage_score  = 1.99    ← 不到 3.0
+  envelope_score = 1.33    ← 不到 3.0
+
+PVDF 绝对能量: 0.00028 V²，仅比干净区高 3.7 倍
+PR std:        0.0015V，无任何变化
+```
+
+**根因**：`wavelet_motion_energy_z` 内部用全文件 `robust_positive_z` 做归一化。安静睡眠时高频细节能量的中位数和 MAD 极小，即使绝对能量只有微弱的 3.7 倍波动，z-score 也被放大到 13.25。0.2 × 13.25 = 2.65，加上 voltage 和 envelope 的小幅贡献后融合分数突破 3.0。这是统计学上的异常，生理上的正常。
+
+**解决**：保留 PVDF 小波细节能量，但把它降级为“辅助证据”，默认对小波 z-score 做 `wavelet_z_cap = 5.0` 截断。这样默认权重 `wavelet_motion_weight = 0.20` 时，小波项最多贡献 1.0 分；只有 voltage/envelope 或 PR 也有明显变化时，融合分数才会越过体动阈值。500s 附近这种“PVDF 呼吸波形好、PR 不动、只有小波 z-score 虚高”的片段不再被判体动。
+
+可调参数：
+
+```powershell
+python .\quality_gating.py --wavelet-z-cap 4 --out-dir .\outputs\wavelet_cap4
+python .\quality_gating.py --wavelet-motion-weight 0 --out-dir .\outputs\no_wavelet
+```
+
+---
+
 ## 是否需要机器学习
 
 当前不需要。一晚数据不够训任何模型。

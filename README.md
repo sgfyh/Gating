@@ -112,6 +112,7 @@ python .\quality_gating.py --input 'F:\双通道睡眠实验\2026_0413晚\数据
 - `voltage_rate_weight`：PVDF+压阻短时电压变化率权重，默认 0.40。
 - `envelope_rate_weight`：PVDF+压阻包络变化率权重，默认 0.40。
 - `wavelet_motion_weight`：PVDF-only 小波细节能量权重，默认 0.20；设为 0 就是只用平滑后的电压变化和包络变化。
+- `wavelet_z_cap`：PVDF-only 小波 z-score 上限，默认 5.0。它让小波只作为辅助证据，避免安静段 MAD 很小时，正常呼吸中的微弱高频波动被放大成体动。
 - `min_pass_quality`：通过门控的最低 SQI，默认 60。
 
 SQI 当前不是训练模型，而是可解释的规则分数：
@@ -144,3 +145,11 @@ python .\quality_gating.py --wavelet-motion-weight 0 --out-dir .\outputs\no_wave
 ```
 
 再和默认 `wavelet_motion_weight=0.20` 的结果比较窗口通过率、体动占比和人工标注一致性。
+
+如果发现呼吸波形肉眼很好、但只有小波分量过高导致误判，可以调低：
+
+```powershell
+python .\quality_gating.py --wavelet-z-cap 4 --out-dir .\outputs\wavelet_cap4
+```
+
+若要完全不用小波，仍然用 `--wavelet-motion-weight 0`。

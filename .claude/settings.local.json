@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip list *)",
+      "Bash(where python *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import numpy as np; d=np.load\\('_segment_500.npz'\\); print\\(list\\(d.keys\\(\\)\\)\\); [print\\(k, d[k].shape, d[k].dtype\\) for k in d.keys\\(\\)]\")"
+    ]
+  }
+}
