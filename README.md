@@ -1,155 +1,89 @@
-# PVDF + 压阻双通道质量门控
+# PVDF + 压阻双通道体动片段划分
 
-这个目录用于把床下 PVDF + 压阻双通道数据整理成一套可复现实验：先判断体动/低质量片段，再输出窗口级信号质量表、总览图和论文可用统计。
-
-## 为什么这个方向合理
-
-PVDF 对动态压力变化敏感，适合作为呼吸主信号；压阻通道包含静态载荷、接触状态和姿态变化信息。把二者融合成质量门控，能在呼吸率估计前剔除体动伪迹，比直接对整段信号做 FFT 或峰值检测更适合床下非接触睡眠监测。
-
-推荐论文主线：
-
-> 基于 PVDF-压阻双通道床垫传感的睡眠呼吸信号质量门控方法
-
-## 已实现内容
-
-- ADC 异常值清洗和插值
-- 500 Hz 原始数据降采样到 50 Hz
-- PVDF 呼吸成分提取：DB5 小波近似分量 + 呼吸频带滤波
-- 体动分数：PVDF+压阻电压变化率、PVDF+压阻包络变化率、PVDF-only 小波细节能量
-- 鲁棒自适应阈值门控
-- 30 s 窗、5 s 步长的窗口级 SQI
-- 呼吸率估计：峰间距优先，频谱峰作为质量特征
-- 输出窗口表、摘要和论文可用图片
-
-## 运行方式
-
-单文件：
-
-```powershell
-python .\quality_gating.py --input 'F:\双通道睡眠实验\2026_0413晚\数据\20260414_033313.csv' --out-dir .\outputs\20260414_033313
-```
-
-整晚批量：
-
-```powershell
-python .\quality_gating.py --input 'F:\双通道睡眠实验\2026_0413晚\数据' --out-dir .\outputs\2026_0413_night
-```
-
-主要输出：
-
-- `quality_windows.csv`：每个窗口的质量、体动比例、呼吸率和是否通过门控
-- `summary.json` / `summary.txt`：单个 CSV 的统计摘要
-- `quality_gating_overview.png`：整段总览图
-- `quality_gating_detail.png`：最强体动附近的局部图
-- `quiet_segments.csv`：体动分割后的安静段，两次体动之间为一段
-- `breath_frames.csv`：安静段内的谷到谷呼吸帧和逐帧 RR/振幅
-- `baseline.json`：由高 SQI 正常呼吸帧得到的正常 RR 和振幅基线
-- `event_candidates.csv`：基于谷间间隔和相对基线振幅下降的事件候选
-- `event_candidates_overview.png`：安静段和事件候选总览图
-- `batch_summary.csv`：批量处理时的文件级汇总表
-
-## 新架构：体动分段 + 双线分析
-
-当前代码不再只把 SQI 当成最终筛选器。主流程变成：
+当前脚本只做体动片段划分：
 
 ```text
-原始 PVDF+压阻
-  -> 逐采样点体动检测
-  -> 按体动切成安静段
-  -> 安静段内谷到谷呼吸分帧
-  -> SQI 高的正常帧建立 RR/振幅基线
-  -> 线路 A：输出逐帧 RR 时间序列
-  -> 线路 B：输出低振幅或长谷间隔事件候选
+原始 PVDF + 压阻
+-> 电压变化率 + 包络变化率
+-> 得到候选体动片段
+-> 对每个候选片段计算方差
+-> 长候选片段用方差二次确认，短候选片段直接保留
+-> 方差大的保留为体动，方差小的放回 clean
 ```
 
-这样做的原因是：固定 30 s 窗口会把呼吸暂停/低通气事件切碎，而且旧版 `low_quality` 里同时混有“体动污染”和“呼吸静默”。新版先用体动作为天然边界，只在安静段里分析呼吸；SQI 主要用于找正常呼吸基线，不直接决定事件是否存在。
+不再做 SQI、低通气/暂停、小波、SampEn 或窗口级判断。
 
-事件候选规则目前是纯规则：
+## 运行
 
-- 谷到谷间隔 `>= min_event_sec`，输出长间隔/暂停候选；
-- 连续低振幅帧累计 `>= min_event_sec`，输出低通气或低振幅暂停候选；
-- 振幅基线来自高 SQI、正常周期的 PVDF 呼吸帧；
-- 默认低通气阈值为相对基线下降 `>= 30%`，暂停阈值为下降 `>= 90%`。
+在 `quality_gating.py` 顶部修改：
 
-这些只是候选事件，正式论文或诊断结论还需要人工标注、视频或参考呼吸带验证。
+```python
+DEFAULT_CSV = Path(...)
+OUTPUT_DIR = Path("outputs")
+USER_CONFIG = {...}
+```
 
-## 当前 2026-04-13 晚数据结果
+然后直接运行：
 
-批量处理 `F:\双通道睡眠实验\2026_0413晚\数据` 后：
+```powershell
+python .\quality_gating.py
+```
 
-- 总时长：约 9.77 h
-- 加权窗口通过率：约 77.50%
-- 加权体动占比：约 14.45%
-- 单文件通过窗口中位呼吸率的中位数：约 14.12 bpm
-- 可分析安静段总数：348
-- 谷到谷呼吸帧总数：6527
-- 规则事件候选总数：131
-- `20260414_033313.csv`：窗口通过率 97.46%，体动占比 3.39%，通过窗口中位呼吸率 13.73 bpm
+## 输出
 
-这些数字适合作为论文的初步实验结果，但正式投稿前建议补人工标注或参考呼吸带/视频标注，用来评价体动门控的精确率、召回率和对呼吸率误差的改善。
+- `motion_segments.csv`：最终体动片段。
+- `clean_segments.csv`：去掉体动后的可用片段。
+- `motion_steps.csv`：逐采样点步骤诊断表。
+- `motion_overview.png`：整段分步骤可视化。
+- `motion_detail.png`：最强体动分数附近的局部图。
+- `summary.json` / `summary.txt`：总体统计和参数。
 
-## 下一步建议
-
-1. 人工标 30-60 分钟体动片段，得到 motion / non-motion 真值。
-2. 做消融实验：PVDF-only、PR-only、PVDF+PR。
-3. 做门控前后对比：呼吸率方差、CV、无效窗口比例。
-4. 采集至少 3 种姿态或 3 个夜晚，形成更像论文的数据表。
-
-## 算法细节说明
-
-如果要把当前算法过程发给 ChatGPT 网页版、导师或合作者，让对方继续帮你想 idea、实验设计或论文表达，请直接使用：
-
-- `ALGORITHM_DETAILS.md`：完整算法流程、变量定义、体动门控公式、SQI 公式和输出解释。
-
-## 参数与 SQI 说明
-
-`quality_gating.py` 里的 `GateConfig` 是全部参数入口。最常改的是：
-
-- `window_sec`：SQI 窗口长度，默认 30 s。可以放宽到 60 s 让结果更稳，也可以缩短到 20 s 让体动定位更灵敏。
-- `step_sec`：滑窗步长，默认 5 s。越小输出越密，但相邻窗口越相似。
-- `motion_threshold_z`：体动分数阈值，默认 3。变大更保守，变小更敏感。
-- `pvdf_weight`：PVDF 和压阻体动分数融合权重，默认 0.5，即两通道同等重要。压阻只用于体动判断，不用于呼吸率估计。
-- `voltage_rate_weight`：PVDF+压阻短时电压变化率权重，默认 0.40。
-- `envelope_rate_weight`：PVDF+压阻包络变化率权重，默认 0.40。
-- `wavelet_motion_weight`：PVDF-only 小波细节能量权重，默认 0.20；设为 0 就是只用平滑后的电压变化和包络变化。
-- `wavelet_z_cap`：PVDF-only 小波 z-score 上限，默认 5.0。它让小波只作为辅助证据，避免安静段 MAD 很小时，正常呼吸中的微弱高频波动被放大成体动。
-- `min_pass_quality`：通过门控的最低 SQI，默认 60。
-
-SQI 当前不是训练模型，而是可解释的规则分数：
+`motion_steps.csv` 的关键步骤：
 
 ```text
-SQI = 50
-      + 呼吸频带能量奖励，最多 +30
-      + 频谱主峰突出程度奖励，最多 +15
-      + 呼吸峰间期稳定性奖励，最多 +10
-      - 80 * 体动占比
-      - 120 * 异常 ADC 占比
+raw_candidate  = motion_score > motion_threshold_z
+after_pre_dilate = 候选体动先向两边拓展 pre_motion_dilate_sec 秒
+after_first_merge = 先把间隔不超过 motion_merge_gap_sec 的候选段合并
+after_split    = 长候选段中，只保留有电压变化率支撑或强分数支撑的部分
+after_variance = 候选片段方差足够大
+after_second_merge = 方差确认后再次合并，参与分离的片段也参与合并
+final_motion   = 最终体动片段，并向两边拓展 motion_dilate_sec 秒
 ```
 
-现在的版本只用 PVDF 估计呼吸率和呼吸质量。压阻通道不再做呼吸分析，因为当前硬件是 PVDF 与压阻平行排列的两个通道，不是压力分布阵列；压阻更适合当作姿态变化、接触变化和体动扰动的辅助通道。
+## 默认参数
 
-最终分类不是只看 SQI。代码先用硬规则把窗口分为：
-
-- `invalid`：坏点太多；
-- `motion`：体动占比太高；
-- `low_quality`：呼吸率不合理或呼吸频带能量太低；
-- `usable`：轻微体动，但还能用；
-- `good`：稳定窗口。
-
-最后只有 `good` 或 `usable`，并且 `SQI >= 60` 的窗口才会 `pass_gate=True`。
-
-如果想验证“小波细节能量有没有必要”，可以跑一组消融：
-
-```powershell
-python .\quality_gating.py --wavelet-motion-weight 0 --out-dir .\outputs\no_wavelet
+```text
+motion_threshold_z = 2.2
+segment_variance_threshold_v = 0.15
+segment_variance_min_sec = 3.0
+pre_motion_dilate_sec = 0.5
+motion_merge_gap_sec = 3.0
+motion_dilate_sec = 2.0
+pvdf_weight = 0.6
+voltage_rate_weight = 0.5
+envelope_rate_weight = 0.5
+segment_pr_variance_gain = 4.0
+long_candidate_split_min_sec = 10.0
+long_candidate_voltage_support_z = 16.0
+long_candidate_strong_score_z = 25.0
 ```
 
-再和默认 `wavelet_motion_weight=0.20` 的结果比较窗口通过率、体动占比和人工标注一致性。
+说明：
 
-如果发现呼吸波形肉眼很好、但只有小波分量过高导致误判，可以调低：
+- `motion_threshold_z` 是固定直接阈值，越低候选越多。
+- `segment_variance_threshold_v` 越高，越容易把小幅稳定变化放回 clean。
+- `segment_variance_threshold_v <= 0` 会关闭方差过滤，所有候选都保留。
+- `segment_variance_min_sec = 3.0` 表示只对持续大于 3 秒的候选片段做方差确认，3 秒及以下的小体动先保留。
+- `pre_motion_dilate_sec = 0.5` 表示候选体动先向两边各拓展 0.5 秒，再做第一次合并。
+- `motion_merge_gap_sec = 3.0` 表示方差确认完成后，最终保留的体动段间隔不超过 3 秒时合并。
+- `motion_dilate_sec = 2.0` 表示最终合并后向两边各拓展 2 秒，用来补回长段分离后被切瘦的体动边界。
+- `long_candidate_split_min_sec = 10.0` 表示只对超过 10 秒的长候选段做分离。
+- `long_candidate_voltage_support_z` 和 `long_candidate_strong_score_z` 是长段分离用的更高阈值，防止正常幅度变化和两边真实体动粘连后一起进入方差判断。
 
-```powershell
-python .\quality_gating.py --wavelet-z-cap 4 --out-dir .\outputs\wavelet_cap4
+片段方差分数：
+
+```text
+segment_variance_score = max(std(PVDF), segment_pr_variance_gain * std(PR))
 ```
 
-若要完全不用小波，仍然用 `--wavelet-motion-weight 0`。
+这样压阻因为接触原因出现“电压变小但稳定”的时段，一般不会因为稳定低电压本身被判成体动；只有候选片段内部波动方差足够大，才会保留为体动。
