@@ -21,20 +21,18 @@ OUTPUT_DIR = Path(f"outputs\\{DATE_NAME}\\{CSV_NAME}_analysis")
 USER_CONFIG = {
     "fs_raw": 500.0, # 原始采样率，单位Hz
     "downsample_q": 10, # 下采样倍数，越大计算越快，但可能丢失短暂运动段
-    "motion_threshold_z": 2.2, # 运动得分阈值，单位为 robust z-score，越大越严格
-    "pre_motion_dilate_sec": 1.0, # 候选体动先向两边扩张，单位秒
-    "motion_merge_gap_sec": 5.0, # 第一次合并相隔不超过这个时间的运动段，单位秒
+    "motion_threshold_z": 2.0, # 运动得分阈值，单位为 robust z-score，越大越严格
+    "pre_motion_dilate_sec": 0.0, # 候选体动先向两边扩张，单位秒
+    "motion_merge_gap_sec": 5.0, # 合并相隔不超过这个时间的候选事件，单位秒
+    "event_split_min_sec": 25.0, # 只分离超过该时长的长候选事件，单位秒
+    "event_split_gap_sec": 2.0, # 长候选事件内部间隔超过该值则切开，单位秒
     "motion_dilate_sec": 2.0, # 最终体动段边界扩张，单位秒
-    "pvdf_weight": 0.6, # PVDF信号权重
+    "pvdf_weight": 0.5, # PVDF信号权重
     "voltage_rate_weight": 0.5, # 电压变化率权重
     "envelope_rate_weight": 0.5, # 包络变化率权重
-    "segment_variance_threshold_v": 0.15, # 段方差阈值，单位为电压
-    "segment_variance_min_sec": 5.0, # 方差计算最小段长度，单位秒
-    "segment_pr_variance_gain": 4.0, # PR信号方差增益
-    "long_candidate_voltage_support_z": 16.0, # 长候选段电压支持阈值，单位 robust z-score
-    "long_candidate_strong_score_z": 25.0, # 长候选段强运动得分阈值，单位 robust z-score
-    "long_candidate_support_pad_sec": 0.25, # 长候选段支持边界扩展，单位秒
-    "long_candidate_split_min_sec": 15.0, # 只对超过这个时长的候选段做分离，单位秒
+    "kalman_context_sec": 25.0, # 每个候选段前后用于建立呼吸模型的clean时长，单位秒
+    "kalman_residual_threshold_z": 6.0, # 候选段Kalman残差确认阈值，越大越严格
+    "pr_contact_threshold_z": 12.0, # PR接触变化确认阈值，越大越严格
     "min_clean_segment_sec": 10.0, # 最小清洁段长度，单位秒
 }
 
@@ -46,9 +44,11 @@ class GateConfig:
     adc_max: float = 4095.0
     adc_vref: float = 3.3
 
-    motion_threshold_z: float = 2.0
-    pre_motion_dilate_sec: float = 0.5
-    motion_merge_gap_sec: float = 3.0
+    motion_threshold_z: float = 3.0
+    pre_motion_dilate_sec: float = 1.0
+    motion_merge_gap_sec: float = 5.0
+    event_split_min_sec: float = 25.0
+    event_split_gap_sec: float = 2.0
     motion_dilate_sec: float = 2.0
     edge_guard_sec: float = 3.0
 
@@ -56,13 +56,9 @@ class GateConfig:
     voltage_rate_weight: float = 0.5
     envelope_rate_weight: float = 0.5
 
-    segment_variance_threshold_v: float = 2.0
-    segment_variance_min_sec: float = 3.0
-    segment_pr_variance_gain: float = 4.0
-    long_candidate_voltage_support_z: float = 16.0
-    long_candidate_strong_score_z: float = 25.0
-    long_candidate_support_pad_sec: float = 0.25
-    long_candidate_split_min_sec: float = 6.0
+    kalman_context_sec: float = 25.0
+    kalman_residual_threshold_z: float = 4.0
+    pr_contact_threshold_z: float = 12.0
 
     bad_fraction_max: float = 0.05
     min_clean_segment_sec: float = 10.0
@@ -220,62 +216,259 @@ def merge_close_motion_segments(
     return merged
 
 
-def segment_variance_score(pvdf_seg: np.ndarray, pr_seg: np.ndarray, cfg: GateConfig) -> tuple[float, float, float]:
-    pvdf_smooth = moving_average(pvdf_seg, int(round(1 * cfg.fs)))
-    pr_smooth = moving_average(pr_seg, int(round(1 * cfg.fs)))
-    pvdf_std = float(np.nanstd(pvdf_smooth**2))
-    pr_std = float(np.nanstd(pr_smooth**2))
-    score = np.mean([pvdf_std, cfg.segment_pr_variance_gain * pr_std])
-    return score, pvdf_std, pr_std
+def merge_runs_by_gap(mask: np.ndarray, gap_samples: int) -> np.ndarray:
+    runs = mask_runs(mask)
+    if not runs:
+        return mask.astype(bool)
+
+    merged = np.zeros_like(mask, dtype=bool)
+    cur_start, cur_end = runs[0]
+    for start, end in runs[1:]:
+        if start - cur_end <= gap_samples:
+            cur_end = end
+        else:
+            merged[cur_start:cur_end] = True
+            cur_start, cur_end = start, end
+    merged[cur_start:cur_end] = True
+    return merged
 
 
-def filter_motion_by_segment_variance(
-    candidate_mask: np.ndarray,
-    pvdf: np.ndarray,
-    pr: np.ndarray,
-    cfg: GateConfig,
-) -> tuple[np.ndarray, np.ndarray]:
-    final = np.zeros_like(candidate_mask, dtype=bool)
-    variance_series = np.zeros_like(pvdf, dtype=float)
+def otsu_threshold(x: np.ndarray, bins: int = 128) -> float | None:
+    finite = np.asarray(x, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size < 8:
+        return None
 
-    for start, end in mask_runs(candidate_mask):
-        variance_score, _, _ = segment_variance_score(pvdf[start:end], pr[start:end], cfg)
-        variance_series[start:end] = variance_score
-        duration_sec = (end - start) / cfg.fs
-        if duration_sec <= cfg.segment_variance_min_sec:
-            final[start:end] = True
-            continue
-        if cfg.segment_variance_threshold_v <= 0 or variance_score >= cfg.segment_variance_threshold_v:
-            final[start:end] = True
+    lo = float(np.nanmin(finite))
+    hi = float(np.nanmax(finite))
+    if hi <= lo:
+        return None
 
-    return final, variance_series
+    hist, edges = np.histogram(finite, bins=bins, range=(lo, hi))
+    total = float(hist.sum())
+    if total <= 0:
+        return None
+
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    weight_bg = np.cumsum(hist).astype(float)
+    weight_fg = total - weight_bg
+    valid = (weight_bg > 0) & (weight_fg > 0)
+    if not np.any(valid):
+        return None
+
+    sum_total = float(np.sum(hist * centers))
+    sum_bg = np.cumsum(hist * centers)
+    mean_bg = np.divide(sum_bg, weight_bg, out=np.zeros_like(sum_bg), where=weight_bg > 0)
+    mean_fg = np.divide(sum_total - sum_bg, weight_fg, out=np.zeros_like(sum_bg), where=weight_fg > 0)
+    between_var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+    between_var[~valid] = -np.inf
+    return float(centers[int(np.argmax(between_var))])
 
 
-def split_long_candidates_by_voltage_support(
-    candidate_mask: np.ndarray,
-    voltage_score: np.ndarray,
+def adaptive_event_core(local_score: np.ndarray, cfg: GateConfig) -> np.ndarray | None:
+    threshold = otsu_threshold(local_score)
+    if threshold is None:
+        return None
+
+    core = np.asarray(local_score, dtype=float) >= max(float(cfg.motion_threshold_z), threshold)
+    finite = np.asarray(local_score, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None
+
+    high = finite[finite >= threshold]
+    low = finite[finite < threshold]
+    high_ratio = high.size / finite.size
+    if high.size == 0 or low.size == 0:
+        return None
+    if high_ratio < 0.005 or high_ratio > 0.60:
+        return None
+
+    _, scale = robust_scale(finite)
+    separation = (float(np.nanmean(high)) - float(np.nanmean(low))) / max(scale, 1e-12)
+    if separation < 1.5:
+        return None
+
+    return core
+
+
+def separate_long_candidate_events(
+    candidate_event: np.ndarray,
     motion_score: np.ndarray,
+    pvdf_score: np.ndarray,
+    pr_score: np.ndarray,
     cfg: GateConfig,
 ) -> np.ndarray:
-    refined = np.zeros_like(candidate_mask, dtype=bool)
-    pad = int(round(cfg.long_candidate_support_pad_sec * cfg.fs))
+    separated = np.zeros_like(candidate_event, dtype=bool)
+    min_len = int(round(cfg.event_split_min_sec * cfg.fs))
+    split_gap = int(round(cfg.event_split_gap_sec * cfg.fs))
+    pad = int(round(cfg.pre_motion_dilate_sec * cfg.fs))
 
-    for start, end in mask_runs(candidate_mask):
-        duration_sec = (end - start) / cfg.fs
-        if duration_sec <= cfg.long_candidate_split_min_sec:
-            refined[start:end] = True
+    for start, end in mask_runs(candidate_event):
+        if end - start <= min_len:
+            separated[start:end] = True
             continue
 
-        local_support = (
-            (voltage_score[start:end] >= cfg.long_candidate_voltage_support_z)
-            | (motion_score[start:end] >= cfg.long_candidate_strong_score_z)
-        )
-        if pad > 0:
-            local_support = expand_mask(local_support, pad)
-        local_support &= candidate_mask[start:end]
-        refined[start:end] = local_support
+        local_cores = []
+        for score in (motion_score, pvdf_score, pr_score):
+            local_core = adaptive_event_core(score[start:end], cfg)
+            if local_core is not None and np.any(local_core):
+                local_cores.append(local_core)
 
-    return refined
+        if not local_cores:
+            # 长事件如果没有可靠的高分核心，更像体位/接触漂移，不再送入Kalman验证。
+            continue
+
+        local_core = np.logical_or.reduce(local_cores)
+        local = expand_mask(local_core, pad)
+        local = merge_runs_by_gap(local, split_gap)
+        separated[start:end] = local & candidate_event[start:end]
+
+    return separated
+
+
+def kalman_breath_signal(pvdf: np.ndarray, cfg: GateConfig) -> np.ndarray:
+    trend = moving_average(pvdf, int(round(8.0 * cfg.fs)))
+    resp = pvdf - trend
+    return moving_average(resp, int(round(0.15 * cfg.fs)))
+
+
+def estimate_breath_hz(context: np.ndarray, cfg: GateConfig) -> float:
+    min_breath_hz = 0.08
+    max_breath_hz = 0.60
+    default_breath_hz = 0.25
+    x = np.asarray(context, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < max(8, int(round(4.0 * cfg.fs))):
+        return default_breath_hz
+
+    x = x - np.nanmedian(x)
+    nperseg = min(x.size, max(16, int(round(20.0 * cfg.fs))))
+    freqs, power = signal.welch(x, fs=cfg.fs, nperseg=nperseg)
+    band = (freqs >= min_breath_hz) & (freqs <= max_breath_hz)
+    if not np.any(band):
+        return default_breath_hz
+
+    band_power = power[band]
+    if band_power.size == 0 or not np.any(np.isfinite(band_power)) or float(np.nanmax(band_power)) <= 0:
+        return default_breath_hz
+    return float(freqs[band][int(np.nanargmax(band_power))])
+
+
+def oscillator_transition(freq_hz: float, cfg: GateConfig) -> np.ndarray:
+    theta = 2.0 * np.pi * float(freq_hz) / cfg.fs
+    c = float(np.cos(theta))
+    s = float(np.sin(theta))
+    return np.array([[c, s], [-s, c]], dtype=float)
+
+
+def kalman_predict(x: np.ndarray, p: np.ndarray, f: np.ndarray, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = f @ x
+    p = f @ p @ f.T + q
+    return x, p
+
+
+def kalman_update(x: np.ndarray, p: np.ndarray, y: float, r: float) -> tuple[np.ndarray, np.ndarray, float]:
+    innovation = float(y - x[0])
+    s = float(p[0, 0] + r)
+    k = p[:, 0] / max(s, 1e-12)
+    x = x + k * innovation
+    h = np.array([[1.0, 0.0]], dtype=float)
+    p = (np.eye(2) - k[:, None] @ h) @ p
+    return x, p, innovation
+
+
+def kalman_segment_residual(
+    resp: np.ndarray,
+    candidate_mask: np.ndarray,
+    start: int,
+    end: int,
+    cfg: GateConfig,
+) -> tuple[float, np.ndarray]:
+    context_radius = int(round(cfg.kalman_context_sec * cfg.fs))
+    min_context = int(round(8.0 * cfg.fs))
+    pre_start = max(0, start - context_radius)
+    post_end = min(len(resp), end + context_radius)
+
+    before_idx = np.arange(pre_start, start, dtype=int)
+    after_idx = np.arange(end, post_end, dtype=int)
+    before_idx = before_idx[~candidate_mask[before_idx]]
+    after_idx = after_idx[~candidate_mask[after_idx]]
+    context_idx = np.r_[before_idx, after_idx]
+
+    min_before = max(3, int(round(2.0 * cfg.fs)))
+    if context_idx.size < min_context or before_idx.size < min_before:
+        fallback_score = max(float(cfg.kalman_residual_threshold_z) + 1.0, 1.0)
+        return fallback_score, np.full(end - start, fallback_score, dtype=float)
+
+    context = resp[context_idx]
+    center, amp_scale = robust_scale(context)
+    y = (resp - center) / max(amp_scale, 1e-12)
+    freq_hz = estimate_breath_hz(context, cfg)
+    f = oscillator_transition(freq_hz, cfg)
+    q = np.eye(2, dtype=float) * 1e-4
+    r = 0.05
+
+    x = np.array([float(y[before_idx[0]]), 0.0], dtype=float)
+    p = np.eye(2, dtype=float)
+    innovations: list[float] = []
+    prev = int(before_idx[0])
+
+    for idx in before_idx[1:]:
+        steps = max(1, min(int(idx - prev), int(round(2.0 * cfg.fs))))
+        for _ in range(steps):
+            x, p = kalman_predict(x, p, f, q)
+        x, p, innovation = kalman_update(x, p, float(y[idx]), r)
+        innovations.append(innovation)
+        prev = int(idx)
+
+    if not innovations:
+        residual_scale = 1.0
+    else:
+        _, residual_scale = robust_scale(np.asarray(innovations, dtype=float))
+        residual_scale = max(residual_scale, r)
+
+    residual_z = np.zeros(end - start, dtype=float)
+    prev = int(before_idx[-1])
+    for out_i, idx in enumerate(range(start, end)):
+        steps = max(1, min(int(idx - prev), int(round(2.0 * cfg.fs))))
+        for _ in range(steps):
+            x, p = kalman_predict(x, p, f, q)
+        residual_z[out_i] = abs(float(y[idx]) - float(x[0])) / residual_scale
+        prev = int(idx)
+
+    score = float(np.nanpercentile(residual_z, 95.0))
+    return score, residual_z
+
+
+def verify_candidate_events(
+    candidate_mask: np.ndarray,
+    pvdf: np.ndarray,
+    pr_score: np.ndarray,
+    cfg: GateConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    verified = np.zeros_like(candidate_mask, dtype=bool)
+    residual_series = np.zeros_like(pvdf, dtype=float)
+    kalman_score_series = np.zeros_like(pvdf, dtype=float)
+    pr_score_series = np.zeros_like(pr_score, dtype=float)
+    verification_series = np.zeros_like(pvdf, dtype=float)
+    resp = kalman_breath_signal(pvdf, cfg)
+
+    for start, end in mask_runs(candidate_mask):
+        kalman_score, residual_z = kalman_segment_residual(resp, candidate_mask, start, end, cfg)
+        contact_score = float(np.nanpercentile(pr_score[start:end], 95.0))
+        kalman_norm = kalman_score / max(float(cfg.kalman_residual_threshold_z), 1e-12)
+        pr_norm = contact_score / max(float(cfg.pr_contact_threshold_z), 1e-12)
+        verification_score = max(kalman_norm, pr_norm)
+
+        residual_series[start:end] = residual_z
+        kalman_score_series[start:end] = kalman_score
+        pr_score_series[start:end] = contact_score
+        verification_series[start:end] = verification_score
+        if verification_score >= 1.0:
+            verified[start:end] = True
+
+    return verified, residual_series, kalman_score_series, pr_score_series, verification_series
 
 
 def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> dict[str, np.ndarray | float]:
@@ -303,25 +496,15 @@ def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> di
     threshold = max(0.0, float(cfg.motion_threshold_z))
     raw_candidate = motion_score > threshold
     pre_dilated_candidate = expand_mask(raw_candidate, int(round(cfg.pre_motion_dilate_sec * cfg.fs)))
-    merged_candidate = merge_close_motion_segments(pre_dilated_candidate, cfg)
-    split_candidate = split_long_candidates_by_voltage_support(
-        merged_candidate,
-        voltage_score,
-        motion_score,
-        cfg,
-    )
-    variance_motion, segment_variance_series = filter_motion_by_segment_variance(
-        split_candidate,
+    candidate_event = merge_close_motion_segments(pre_dilated_candidate, cfg)
+    separated_event = separate_long_candidate_events(candidate_event, motion_score, pvdf_score, pr_score, cfg)
+    verified_motion, kalman_residual_series, kalman_score_series, pr_contact_score_series, verification_score = verify_candidate_events(
+        separated_event,
         pvdf,
-        pr,
+        pr_score,
         cfg,
     )
-    removed_by_split = merged_candidate & ~split_candidate
-    merged_motion = merge_close_motion_segments(
-        variance_motion,
-        cfg,
-    )
-    final_motion = expand_mask(merged_motion, int(round(cfg.motion_dilate_sec * cfg.fs)))
+    final_motion = expand_mask(verified_motion, int(round(cfg.motion_dilate_sec * cfg.fs)))
 
     return {
         "pvdf_voltage_rate_z": pvdf_motion["voltage_rate_z"],
@@ -334,14 +517,18 @@ def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> di
         "envelope_score": envelope_score,
         "motion_score": motion_score,
         "motion_threshold": float(threshold),
-        "segment_variance_score": segment_variance_series,
+        "kalman_residual_z": kalman_residual_series,
+        "kalman_segment_score": kalman_score_series,
+        "kalman_threshold": float(cfg.kalman_residual_threshold_z),
+        "pr_contact_segment_score": pr_contact_score_series,
+        "pr_contact_threshold": float(cfg.pr_contact_threshold_z),
+        "verification_score": verification_score,
+        "verification_threshold": 1.0,
         "raw_candidate_mask": raw_candidate,
         "pre_dilated_candidate_mask": pre_dilated_candidate,
-        "merged_candidate_mask": merged_candidate,
-        "split_candidate_mask": split_candidate,
-        "split_removed_mask": removed_by_split,
-        "variance_motion_mask": variance_motion,
-        "merged_motion_mask": merged_motion,
+        "candidate_event_mask": candidate_event,
+        "separated_event_mask": separated_event,
+        "verified_motion_mask": verified_motion,
         "motion_mask": final_motion,
     }
 
@@ -379,27 +566,28 @@ def add_segment_diagnostics(
     out = segments.copy()
     max_motion_score = []
     mean_motion_score = []
-    variance_score = []
-    pvdf_std = []
-    pr_std = []
+    max_kalman_residual_z = []
+    mean_kalman_residual_z = []
+    kalman_segment_score = []
+    pr_contact_segment_score = []
+    verification_score = []
 
     for row in out.itertuples(index=False):
         start = int(row.start_idx)
         end = int(row.end_idx)
-        seg_variance_score, seg_pvdf_std, seg_pr_std = segment_variance_score(
-            data["pvdf"][start:end],
-            data["pr"][start:end],
-            cfg,
-        )
         max_motion_score.append(float(np.nanmax(gate["motion_score"][start:end])))
         mean_motion_score.append(float(np.nanmean(gate["motion_score"][start:end])))
-        variance_score.append(seg_variance_score)
-        pvdf_std.append(seg_pvdf_std)
-        pr_std.append(seg_pr_std)
+        max_kalman_residual_z.append(float(np.nanmax(gate["kalman_residual_z"][start:end])))
+        mean_kalman_residual_z.append(float(np.nanmean(gate["kalman_residual_z"][start:end])))
+        kalman_segment_score.append(float(np.nanmax(gate["kalman_segment_score"][start:end])))
+        pr_contact_segment_score.append(float(np.nanmax(gate["pr_contact_segment_score"][start:end])))
+        verification_score.append(float(np.nanmax(gate["verification_score"][start:end])))
 
-    out["segment_variance_score"] = variance_score
-    out["pvdf_std"] = pvdf_std
-    out["pr_std"] = pr_std
+    out["kalman_segment_score"] = kalman_segment_score
+    out["pr_contact_segment_score"] = pr_contact_segment_score
+    out["verification_score"] = verification_score
+    out["max_kalman_residual_z"] = max_kalman_residual_z
+    out["mean_kalman_residual_z"] = mean_kalman_residual_z
     out["max_motion_score"] = max_motion_score
     out["mean_motion_score"] = mean_motion_score
     return out
@@ -451,7 +639,7 @@ def plot_overview(out_path: Path, data: dict[str, np.ndarray], gate: dict[str, n
     stride = max(1, int(np.ceil(len(t) / max_points)))
     sl = slice(None, None, stride)
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
     # pvdf_norm = normalized_for_plot(data["pvdf"])
     # pr_norm = normalized_for_plot(data["pr"])
     pvdf_norm = data["pvdf"]
@@ -471,20 +659,24 @@ def plot_overview(out_path: Path, data: dict[str, np.ndarray], gate: dict[str, n
     axes[1].set_ylabel("score")
     axes[1].legend(loc="upper right")
 
-    axes[2].plot(t[sl], gate["segment_variance_score"][sl], color="tab:purple", linewidth=0.8, label="segment variance")
-    if cfg.segment_variance_threshold_v > 0:
-        axes[2].axhline(cfg.segment_variance_threshold_v, color="black", linestyle="--", linewidth=1.0, label="variance threshold")
-    set_robust_ylim(axes[2], gate["segment_variance_score"][sl], 0.0, 99.5)
-    axes[2].set_ylabel("std")
+    axes[2].plot(t[sl], gate["kalman_residual_z"][sl], color="tab:purple", linewidth=0.8, label="Kalman residual")
+    axes[2].plot(t[sl], gate["pr_score"][sl], color="tab:orange", linewidth=0.7, alpha=0.8, label="PR contact score")
+    axes[2].plot(t[sl], gate["verification_score"][sl], color="tab:green", linewidth=0.9, label="verification score")
+    if cfg.kalman_residual_threshold_z > 0:
+        axes[2].axhline(cfg.kalman_residual_threshold_z, color="black", linestyle="--", linewidth=1.0, label="Kalman threshold")
+    if cfg.pr_contact_threshold_z > 0:
+        axes[2].axhline(cfg.pr_contact_threshold_z, color="tab:orange", linestyle="--", linewidth=0.9, alpha=0.8, label="PR threshold")
+    axes[2].axhline(1.0, color="tab:green", linestyle="--", linewidth=0.9, alpha=0.8, label="verify threshold")
+    set_robust_ylim(axes[2], np.r_[gate["kalman_residual_z"][sl], gate["pr_score"][sl], gate["verification_score"][sl]], 0.0, 99.5)
+    axes[2].set_ylabel("confirm z")
     axes[2].legend(loc="upper right")
 
     mask_lanes = [
         ("candidate", "raw_candidate_mask"),
-        ("dilate0.5", "pre_dilated_candidate_mask"),
-        ("merge1", "merged_candidate_mask"),
-        ("split", "split_candidate_mask"),
-        ("variance", "variance_motion_mask"),
-        ("merge2", "merged_motion_mask"),
+        ("pre_dilate", "pre_dilated_candidate_mask"),
+        ("event", "candidate_event_mask"),
+        ("separate", "separated_event_mask"),
+        ("verify", "verified_motion_mask"),
         ("final", "motion_mask"),
     ]
     for lane, (label, key) in enumerate(mask_lanes):
@@ -521,7 +713,7 @@ def plot_detail(
     end = min(len(t), center + half)
     sl = slice(start, end)
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 8), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(12, 9), sharex=True)
     pvdf_norm = normalized_for_plot(data["pvdf"][sl])
     pr_norm = normalized_for_plot(data["pr"][sl])
     axes[0].plot(t[sl], pvdf_norm, linewidth=1.0, label="PVDF")
@@ -538,19 +730,23 @@ def plot_detail(
     axes[1].set_ylabel("score")
     axes[1].legend(loc="upper right")
 
-    axes[2].plot(t[sl], gate["segment_variance_score"][sl], color="tab:purple", linewidth=0.9, label="segment variance")
-    if cfg.segment_variance_threshold_v > 0:
-        axes[2].axhline(cfg.segment_variance_threshold_v, color="black", linestyle="--", linewidth=1.0)
-    axes[2].set_ylabel("std")
+    axes[2].plot(t[sl], gate["kalman_residual_z"][sl], color="tab:purple", linewidth=0.9, label="Kalman residual")
+    axes[2].plot(t[sl], gate["pr_score"][sl], color="tab:orange", linewidth=0.8, alpha=0.8, label="PR contact score")
+    axes[2].plot(t[sl], gate["verification_score"][sl], color="tab:green", linewidth=0.9, label="verification score")
+    if cfg.kalman_residual_threshold_z > 0:
+        axes[2].axhline(cfg.kalman_residual_threshold_z, color="black", linestyle="--", linewidth=1.0)
+    if cfg.pr_contact_threshold_z > 0:
+        axes[2].axhline(cfg.pr_contact_threshold_z, color="tab:orange", linestyle="--", linewidth=0.9, alpha=0.8)
+    axes[2].axhline(1.0, color="tab:green", linestyle="--", linewidth=0.9, alpha=0.8)
+    axes[2].set_ylabel("confirm z")
     axes[2].legend(loc="upper right")
 
     mask_lanes = [
         ("candidate", "raw_candidate_mask"),
-        ("dilate0.5", "pre_dilated_candidate_mask"),
-        ("merge1", "merged_candidate_mask"),
-        ("split", "split_candidate_mask"),
-        ("variance", "variance_motion_mask"),
-        ("merge2", "merged_motion_mask"),
+        ("pre_dilate", "pre_dilated_candidate_mask"),
+        ("event", "candidate_event_mask"),
+        ("separate", "separated_event_mask"),
+        ("verify", "verified_motion_mask"),
         ("final", "motion_mask"),
     ]
     for lane, (label, key) in enumerate(mask_lanes):
@@ -583,13 +779,18 @@ def build_step_table(data: dict[str, np.ndarray], gate: dict[str, np.ndarray | f
             "pr_voltage_rate_z": gate["pr_voltage_rate_z"],
             "pvdf_env_rate_z": gate["pvdf_env_rate_z"],
             "pr_env_rate_z": gate["pr_env_rate_z"],
-            "segment_variance_score": gate["segment_variance_score"],
+            "kalman_residual_z": gate["kalman_residual_z"],
+            "kalman_segment_score": gate["kalman_segment_score"],
+            "kalman_threshold": np.full_like(data["t"], float(gate["kalman_threshold"]), dtype=float),
+            "pr_contact_segment_score": gate["pr_contact_segment_score"],
+            "pr_contact_threshold": np.full_like(data["t"], float(gate["pr_contact_threshold"]), dtype=float),
+            "verification_score": gate["verification_score"],
+            "verification_threshold": np.full_like(data["t"], float(gate["verification_threshold"]), dtype=float),
             "raw_candidate": np.asarray(gate["raw_candidate_mask"], dtype=np.uint8),
             "after_pre_dilate": np.asarray(gate["pre_dilated_candidate_mask"], dtype=np.uint8),
-            "after_first_merge": np.asarray(gate["merged_candidate_mask"], dtype=np.uint8),
-            "after_split": np.asarray(gate["split_candidate_mask"], dtype=np.uint8),
-            "after_variance": np.asarray(gate["variance_motion_mask"], dtype=np.uint8),
-            "after_second_merge": np.asarray(gate["merged_motion_mask"], dtype=np.uint8),
+            "candidate_event": np.asarray(gate["candidate_event_mask"], dtype=np.uint8),
+            "after_separate": np.asarray(gate["separated_event_mask"], dtype=np.uint8),
+            "after_verify": np.asarray(gate["verified_motion_mask"], dtype=np.uint8),
             "final_motion": np.asarray(gate["motion_mask"], dtype=np.uint8),
         }
     )
@@ -615,8 +816,8 @@ def make_summary(
         "processed_samples": int(len(data["t"])),
         "duration_sec": float(duration),
         "motion_threshold": float(gate["motion_threshold"]),
-        "segment_variance_threshold_v": cfg.segment_variance_threshold_v,
-        "segment_variance_min_sec": cfg.segment_variance_min_sec,
+        "kalman_residual_threshold_z": cfg.kalman_residual_threshold_z,
+        "pr_contact_threshold_z": cfg.pr_contact_threshold_z,
         "motion_seconds": motion_seconds,
         "motion_ratio": float(motion_seconds / duration) if duration else 0.0,
         "clean_seconds": clean_seconds,
@@ -636,8 +837,8 @@ def write_text_summary(path: Path, summary: dict[str, object]) -> None:
         f"Duration: {summary['duration_sec']:.1f} s",
         f"Processed sampling rate: {summary['fs_processed']:.1f} Hz",
         f"Motion threshold: {summary['motion_threshold']}",
-        f"Segment variance threshold: {summary['segment_variance_threshold_v']}",
-        f"Segment variance minimum duration: {summary['segment_variance_min_sec']} s",
+        f"Kalman residual threshold: {summary['kalman_residual_threshold_z']}",
+        f"PR contact threshold: {summary['pr_contact_threshold_z']}",
         f"Motion seconds: {summary['motion_seconds']:.1f}",
         f"Motion ratio: {summary['motion_ratio']:.3f}",
         f"Clean seconds: {summary['clean_seconds']:.1f}",
