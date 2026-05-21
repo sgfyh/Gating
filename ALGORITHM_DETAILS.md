@@ -21,110 +21,94 @@ env_rate_z     = 去趋势后包络的一阶变化率鲁棒 z 分数
 
 电压变化率偏向检测瞬时电压突变；包络变化率偏向检测振幅或接触状态变化。
 
-## 3. 双通道候选生成
+## 3. PR 候选生成
 
 ```text
-voltage_score =
-    pvdf_weight       * PVDF_voltage_rate_z
-  + (1 - pvdf_weight) * PR_voltage_rate_z
+PR_score =
+    voltage_rate_weight  * PR_voltage_rate_z
+  + envelope_rate_weight * PR_env_rate_z
 
-envelope_score =
-    pvdf_weight       * PVDF_env_rate_z
-  + (1 - pvdf_weight) * PR_env_rate_z
-
-motion_score =
-    voltage_rate_weight  * voltage_score
-  + envelope_rate_weight * envelope_score
+candidate_score = moving_average(PR_score, 1 second)
 ```
 
-`voltage_rate_weight` 和 `envelope_rate_weight` 会自动归一化。融合后做 1 秒移动平均，减少单点噪声。
+`voltage_rate_weight` 和 `envelope_rate_weight` 会自动归一化。`candidate_score` 只来自 PR 通道，用 1 秒移动平均减少单点噪声。PVDF_score 和 motion_score 仍然输出到图和表中，作为对照诊断，不参与当前体动 mask。
 
 候选事件生成：
 
 ```text
-raw_candidate = motion_score > motion_threshold_z
+raw_candidate = candidate_score > motion_threshold_z
 pre_dilate    = expand(raw_candidate, pre_motion_dilate_sec)
 candidate_event = merge(pre_dilate, gap <= motion_merge_gap_sec)
 ```
 
-这里 PVDF 主要提供快速冲击/振动证据，PR 主要提供接触压力或体位变化证据。二者在 `motion_score` 中统一融合，不再额外设置单通道候选分支。
+## 4. 两阶段 Otsu 长事件分离
 
-如果候选事件持续时间超过 `event_split_min_sec`，则用 Otsu 在事件内部自动寻找高分核心阈值：
+如果候选事件持续时间超过 `event_split_min_sec`，则在事件内部使用 PVDF 冲击变化率作为分离分数：
+
+```text
+split_pvdf_score  = moving_average(PVDF_voltage_rate_z, 1 second)
+pass1_core        = Otsu(split_pvdf_score)
+pass2_core        = same Otsu union on NOT pass1_core
+final_split_core  = pass1_core OR pass2_core
+```
+
+候选阶段仍用 PR 总分数保证召回；分离阶段不用总分数，是为了降低规则大幅呼吸的电压变化率把长段切碎的风险。包络变化率负责抓突变边界，包络值只作为补充证据，不能独立产生长时间体动 mask。长候选事件内部使用两层 Otsu：第一层先在整个长候选事件内找粗异常核心；如果这个核心仍然过长，第二层只在该核心内部继续找更强异常核心。包络变化率核心可独立成立，包络值核心只有靠近包络变化率核心时才并入。
+
+```text
+layer 1:
+    在整个长候选事件内做 Otsu，得到高分核心
+
+layer 2:
+    如果 layer 1 的高分核心仍然超过 event_split_min_sec，
+    只在该长核心内部再做一次 Otsu，得到更强核心
+
+```
+
+每个阶段都必须满足可靠性条件：
+
+```text
+threshold > motion_threshold_z
+0.005 <= high_ratio <= 0.60
+separation = (mean(high) - mean(low)) / robust_scale(score) >= 1.5
+```
+
+分离逻辑：
 
 ```text
 separated_event =
     keep short candidate_event unchanged
-    high_core = union(
-        reliable Otsu core of motion_score within event,
-        reliable Otsu core of PVDF_score within event,
-        reliable Otsu core of PR_score within event
-    )
-    split long candidate_event when high_core gaps > event_split_gap_sec
-    reject long candidate_event if all Otsu cores are unreliable
+    find reliable two-pass Otsu cores from the PVDF impulse score
+    expand high core locally within candidate support
+    split long candidate_event when high-core gaps > event_split_gap_sec
+    reject long candidate_event if no reliable core exists
 ```
 
-为避免单峰分布被强行切开，Otsu 阈值只有在高分组比例合理、且高低分组均值分离度足够时才启用。长候选事件按融合分数、PVDF 单通道分数和 PR 单通道分数分别寻找核心，再取并集；否则 PR 的巨大接触峰可能会掩盖 PVDF 的真实冲击。若三路都不可靠，该长候选事件视为没有明确体动核心，直接放回 clean。短候选事件不做 Otsu 分离，保持完整进入验证。
+因此，长候选段如果分离不出可靠核心，就直接放回 clean。这是为了避免在单峰或缓慢漂移数据中强行切出体动。
 
-这一步只处理长事件粘连，不承担二阶段确认功能。
+## 5. 持续时间验证与边界修正
 
-## 4. 事件级综合验证
-
-对每个分离后的候选事件计算两个分数。
-
-PVDF Kalman 残差：
+分离后的核心先做持续时间验证，小于 `motion_min_duration_sec` 的孤立短核心放回 clean：
 
 ```text
-候选事件前后 clean PVDF
--> 估计呼吸主频
--> 建立二维呼吸振荡器 Kalman 模型
--> 从候选事件前的 clean 状态开始，只预测、不用候选事件更新
--> 计算候选事件 PVDF 呼吸分量与预测值的残差
-
-kalman_segment_score =
-    percentile(abs(PVDF_resp - Kalman_prediction) / clean_residual_scale, 95)
+after_verify =
+    keep separated_event runs with duration >= motion_min_duration_sec
 ```
 
-PR 接触变化分数：
+通过持续时间验证的事件作为体动核心，再向两边扩展 `motion_dilate_sec` 秒：
 
 ```text
-pr_contact_segment_score =
-    percentile(PR_score within candidate_event, 95)
+final_motion = expand(after_verify, motion_dilate_sec)
 ```
 
-统一验证分数：
-
-```text
-verification_score =
-    max(
-        kalman_segment_score / kalman_residual_threshold_z,
-        pr_contact_segment_score / pr_contact_threshold_z
-    )
-
-verification_score >= 1 -> 保留为体动事件
-verification_score <  1 -> 驳回，放回 clean
-```
-
-这个形式让 PVDF 和 PR 的贡献在同一个公式中体现：PVDF 负责判断呼吸轨迹是否被破坏，PR 负责提供接触/体位变化证据。任一通道达到确认阈值即可保留；如果两个通道都只是中等偏离，则不通过相加确认，从而减少呼吸幅度变化造成的假阳性。
-
-如果候选事件前后的 clean 上下文不足以建立 Kalman 模型，则保留该候选事件，避免模型不可用导致漏检。
-
-## 5. 边界修正
-
-通过验证的候选事件直接作为体动事件，再向两边扩展 `motion_dilate_sec` 秒：
-
-```text
-final_motion = expand(verified_event, motion_dilate_sec)
-```
-
-这样体动核心、尾部恢复段和接触恢复段由候选事件整体保留，不再额外做 split、fill 或二次合并。
+当前主流程不使用 Kalman 残差，也不再单独做 PR 验证。PR 总分数负责候选，PVDF 冲击变化率负责长事件分离；额外 PR 验证不提供独立信息。Kalman 适合做后续对照实验，不放在主算法里。
 
 ## 6. 可视化
 
 `motion_overview.png` 和 `motion_detail.png` 展示：
 
 1. PVDF/PR 波形和最终体动阴影。
-2. 电压变化率、包络变化率和融合体动分数。
-3. Kalman 残差、PR 接触变化分数和统一验证分数。
+2. PR 候选分数、PVDF 参考分数和融合参考分数。
+3. PVDF 冲击分离分数、事件 P95 分离分数和 Otsu 分离阈值。
 4. `candidate -> pre_dilate -> event -> separate -> verify -> final` 的逐步 mask。
 
 `motion_steps.csv` 保存同样的逐点诊断信息。

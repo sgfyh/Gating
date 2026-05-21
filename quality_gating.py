@@ -12,8 +12,11 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 
-DATE_NAME = "2026_0413晚"
-CSV_NAME = "20260414_030313"
+# DATE_NAME = "椅子"
+# CSV_NAME = "WAVE(2026.4.23-16.55.42)"
+# DEFAULT_CSV = Path(f"C:\\Users\\sgfyh\\Desktop\\{CSV_NAME}.csv")
+DATE_NAME = "2026_0423晚"
+CSV_NAME = "20260424_051233"
 DEFAULT_CSV = Path(f"F:\\双通道睡眠实验\\{DATE_NAME}\\数据\\{CSV_NAME}.csv")
 OUTPUT_DIR = Path(f"outputs\\{DATE_NAME}\\{CSV_NAME}_analysis")
 
@@ -21,18 +24,16 @@ OUTPUT_DIR = Path(f"outputs\\{DATE_NAME}\\{CSV_NAME}_analysis")
 USER_CONFIG = {
     "fs_raw": 500.0, # 原始采样率，单位Hz
     "downsample_q": 10, # 下采样倍数，越大计算越快，但可能丢失短暂运动段
-    "motion_threshold_z": 2.0, # 运动得分阈值，单位为 robust z-score，越大越严格
-    "pre_motion_dilate_sec": 0.0, # 候选体动先向两边扩张，单位秒
-    "motion_merge_gap_sec": 5.0, # 合并相隔不超过这个时间的候选事件，单位秒
-    "event_split_min_sec": 25.0, # 只分离超过该时长的长候选事件，单位秒
+    "motion_threshold_z": 5.0, # 运动得分阈值，单位为 robust z-score，越大越严格
+    "pre_motion_dilate_sec": 0.5, # 候选体动先向两边扩张，单位秒
+    "motion_merge_gap_sec": 10.0, # 合并相隔不超过这个时间的候选事件，单位秒
+    "event_split_min_sec": 20.0, # 只分离超过该时长的长候选事件，单位秒
     "event_split_gap_sec": 2.0, # 长候选事件内部间隔超过该值则切开，单位秒
-    "motion_dilate_sec": 2.0, # 最终体动段边界扩张，单位秒
-    "pvdf_weight": 0.5, # PVDF信号权重
+    "motion_min_duration_sec": 1.0, # 小于该时长的分离核心视为短毛刺，放回clean
+    "motion_dilate_sec": 1.0, # 最终体动段边界扩张，单位秒
+    "pvdf_weight": 0.0, # PVDF信号权重
     "voltage_rate_weight": 0.5, # 电压变化率权重
     "envelope_rate_weight": 0.5, # 包络变化率权重
-    "kalman_context_sec": 25.0, # 每个候选段前后用于建立呼吸模型的clean时长，单位秒
-    "kalman_residual_threshold_z": 6.0, # 候选段Kalman残差确认阈值，越大越严格
-    "pr_contact_threshold_z": 12.0, # PR接触变化确认阈值，越大越严格
     "min_clean_segment_sec": 10.0, # 最小清洁段长度，单位秒
 }
 
@@ -44,21 +45,18 @@ class GateConfig:
     adc_max: float = 4095.0
     adc_vref: float = 3.3
 
-    motion_threshold_z: float = 3.0
-    pre_motion_dilate_sec: float = 1.0
-    motion_merge_gap_sec: float = 5.0
-    event_split_min_sec: float = 25.0
+    motion_threshold_z: float = 5.0
+    pre_motion_dilate_sec: float = 0.5
+    motion_merge_gap_sec: float = 10.0
+    event_split_min_sec: float = 15.0
     event_split_gap_sec: float = 2.0
-    motion_dilate_sec: float = 2.0
+    motion_min_duration_sec: float = 1.0
+    motion_dilate_sec: float = 1.0
     edge_guard_sec: float = 3.0
 
-    pvdf_weight: float = 0.6
+    pvdf_weight: float = 0.0
     voltage_rate_weight: float = 0.5
     envelope_rate_weight: float = 0.5
-
-    kalman_context_sec: float = 25.0
-    kalman_residual_threshold_z: float = 4.0
-    pr_contact_threshold_z: float = 12.0
 
     bad_fraction_max: float = 0.05
     min_clean_segment_sec: float = 10.0
@@ -164,6 +162,7 @@ def channel_motion_features(x: np.ndarray, cfg: GateConfig) -> dict[str, np.ndar
 
     return {
         "voltage_rate_z": robust_positive_z(abs_rate(smooth, fs)),
+        "env_level_z": robust_positive_z(env),
         "env_rate_z": robust_positive_z(abs_rate(env, fs)),
     }
 
@@ -265,41 +264,115 @@ def otsu_threshold(x: np.ndarray, bins: int = 128) -> float | None:
     return float(centers[int(np.argmax(between_var))])
 
 
-def adaptive_event_core(local_score: np.ndarray, cfg: GateConfig) -> np.ndarray | None:
-    threshold = otsu_threshold(local_score)
-    if threshold is None:
-        return None
+def reliable_otsu_core(
+    local_score: np.ndarray,
+    cfg: GateConfig,
+    *,
+    min_threshold: float | None = None,
+    max_high_ratio: float = 0.60,
+    upper_threshold: float | None = None,
+    valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, float]:
+    score = np.asarray(local_score, dtype=float)
+    stage_mask = np.isfinite(score)
+    if upper_threshold is not None:
+        stage_mask &= score < upper_threshold
+    if valid_mask is not None:
+        stage_mask &= np.asarray(valid_mask, dtype=bool)
 
-    core = np.asarray(local_score, dtype=float) >= max(float(cfg.motion_threshold_z), threshold)
-    finite = np.asarray(local_score, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return None
+    stage_values = score[stage_mask]
+    threshold = otsu_threshold(stage_values)
+    threshold_floor = float(cfg.motion_threshold_z) if min_threshold is None else float(min_threshold)
+    if threshold is None or threshold <= threshold_floor:
+        return None, np.nan
 
-    high = finite[finite >= threshold]
-    low = finite[finite < threshold]
-    high_ratio = high.size / finite.size
+    high = stage_values[stage_values >= threshold]
+    low = stage_values[stage_values < threshold]
     if high.size == 0 or low.size == 0:
-        return None
-    if high_ratio < 0.005 or high_ratio > 0.60:
-        return None
+        return None, threshold
 
-    _, scale = robust_scale(finite)
+    high_ratio = high.size / stage_values.size
+    if high_ratio < 0.005 or high_ratio > max_high_ratio:
+        return None, threshold
+
+    _, scale = robust_scale(stage_values)
     separation = (float(np.nanmean(high)) - float(np.nanmean(low))) / max(scale, 1e-12)
     if separation < 1.5:
-        return None
+        return None, threshold
 
-    return core
+    core = stage_mask & (score >= threshold)
+    return core, threshold
+
+
+def otsu_union_pass(
+    split_scores: tuple[np.ndarray, ...],
+    cfg: GateConfig,
+    valid_mask: np.ndarray,
+    *,
+    min_threshold: float | None = None,
+    max_high_ratio: float = 0.60,
+) -> tuple[np.ndarray | None, list[float]]:
+    scores = tuple(np.asarray(score, dtype=float) for score in split_scores)
+    if not scores:
+        return None, []
+
+    cores = []
+    thresholds = []
+    for score in scores:
+        core, threshold = reliable_otsu_core(
+            score,
+            cfg,
+            valid_mask=valid_mask,
+            min_threshold=min_threshold,
+            max_high_ratio=max_high_ratio,
+        )
+        if core is not None and np.any(core):
+            cores.append(core)
+            thresholds.append(threshold)
+
+    if not cores:
+        return None, thresholds
+    return np.logical_or.reduce(cores), thresholds
+
+
+def two_stage_otsu_event_core(split_scores: tuple[np.ndarray, ...], cfg: GateConfig) -> tuple[np.ndarray | None, float]:
+    scores = tuple(np.asarray(score, dtype=float) for score in split_scores)
+    if not scores:
+        return None, np.nan
+
+    valid_mask = np.logical_or.reduce([np.isfinite(score) for score in scores])
+
+    first_core, first_thresholds = otsu_union_pass(scores, cfg, valid_mask)
+    if first_core is None or not np.any(first_core):
+        return None, np.nan
+
+    remaining = valid_mask & ~first_core
+    second_core, second_thresholds = otsu_union_pass(
+        scores,
+        cfg,
+        remaining,
+        min_threshold=0.0,
+        max_high_ratio=0.20,
+    )
+
+    if second_core is not None and np.any(second_core):
+        core = first_core | second_core
+        thresholds = first_thresholds + second_thresholds
+    else:
+        core = first_core
+        thresholds = first_thresholds
+
+    finite_thresholds = [float(v) for v in thresholds if np.isfinite(v)]
+    return core, float(np.nanmin(finite_thresholds)) if finite_thresholds else np.nan
 
 
 def separate_long_candidate_events(
     candidate_event: np.ndarray,
-    motion_score: np.ndarray,
-    pvdf_score: np.ndarray,
-    pr_score: np.ndarray,
+    split_scores: tuple[np.ndarray, ...],
     cfg: GateConfig,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     separated = np.zeros_like(candidate_event, dtype=bool)
+    threshold_series = np.full(candidate_event.shape, np.nan, dtype=float)
     min_len = int(round(cfg.event_split_min_sec * cfg.fs))
     split_gap = int(round(cfg.event_split_gap_sec * cfg.fs))
     pad = int(round(cfg.pre_motion_dilate_sec * cfg.fs))
@@ -309,166 +382,43 @@ def separate_long_candidate_events(
             separated[start:end] = True
             continue
 
-        local_cores = []
-        for score in (motion_score, pvdf_score, pr_score):
-            local_core = adaptive_event_core(score[start:end], cfg)
-            if local_core is not None and np.any(local_core):
-                local_cores.append(local_core)
+        local_scores = tuple(score[start:end] for score in split_scores)
 
-        if not local_cores:
-            # 长事件如果没有可靠的高分核心，更像体位/接触漂移，不再送入Kalman验证。
+        local_core, local_threshold = two_stage_otsu_event_core(
+            local_scores,
+            cfg,
+        )
+        if local_core is None or not np.any(local_core):
+            # Long candidates that cannot be split reliably are returned to clean.
             continue
 
-        local_core = np.logical_or.reduce(local_cores)
-        local = expand_mask(local_core, pad)
-        local = merge_runs_by_gap(local, split_gap)
+        if np.isfinite(local_threshold):
+            threshold_series[start:end] = local_threshold
+
+        local_core = expand_mask(local_core, pad)
+        local = merge_runs_by_gap(local_core, split_gap)
         separated[start:end] = local & candidate_event[start:end]
 
-    return separated
+    return separated, threshold_series
 
 
-def kalman_breath_signal(pvdf: np.ndarray, cfg: GateConfig) -> np.ndarray:
-    trend = moving_average(pvdf, int(round(8.0 * cfg.fs)))
-    resp = pvdf - trend
-    return moving_average(resp, int(round(0.15 * cfg.fs)))
+def segment_percentile_score(mask: np.ndarray, score: np.ndarray, percentile: float = 95.0) -> np.ndarray:
+    series = np.zeros_like(score, dtype=float)
+    for start, end in mask_runs(mask):
+        series[start:end] = float(np.nanpercentile(score[start:end], percentile))
+    return series
 
 
-def estimate_breath_hz(context: np.ndarray, cfg: GateConfig) -> float:
-    min_breath_hz = 0.08
-    max_breath_hz = 0.60
-    default_breath_hz = 0.25
-    x = np.asarray(context, dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size < max(8, int(round(4.0 * cfg.fs))):
-        return default_breath_hz
+def remove_short_motion_cores(mask: np.ndarray, cfg: GateConfig) -> np.ndarray:
+    if cfg.motion_min_duration_sec <= 0:
+        return mask.astype(bool)
 
-    x = x - np.nanmedian(x)
-    nperseg = min(x.size, max(16, int(round(20.0 * cfg.fs))))
-    freqs, power = signal.welch(x, fs=cfg.fs, nperseg=nperseg)
-    band = (freqs >= min_breath_hz) & (freqs <= max_breath_hz)
-    if not np.any(band):
-        return default_breath_hz
-
-    band_power = power[band]
-    if band_power.size == 0 or not np.any(np.isfinite(band_power)) or float(np.nanmax(band_power)) <= 0:
-        return default_breath_hz
-    return float(freqs[band][int(np.nanargmax(band_power))])
-
-
-def oscillator_transition(freq_hz: float, cfg: GateConfig) -> np.ndarray:
-    theta = 2.0 * np.pi * float(freq_hz) / cfg.fs
-    c = float(np.cos(theta))
-    s = float(np.sin(theta))
-    return np.array([[c, s], [-s, c]], dtype=float)
-
-
-def kalman_predict(x: np.ndarray, p: np.ndarray, f: np.ndarray, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    x = f @ x
-    p = f @ p @ f.T + q
-    return x, p
-
-
-def kalman_update(x: np.ndarray, p: np.ndarray, y: float, r: float) -> tuple[np.ndarray, np.ndarray, float]:
-    innovation = float(y - x[0])
-    s = float(p[0, 0] + r)
-    k = p[:, 0] / max(s, 1e-12)
-    x = x + k * innovation
-    h = np.array([[1.0, 0.0]], dtype=float)
-    p = (np.eye(2) - k[:, None] @ h) @ p
-    return x, p, innovation
-
-
-def kalman_segment_residual(
-    resp: np.ndarray,
-    candidate_mask: np.ndarray,
-    start: int,
-    end: int,
-    cfg: GateConfig,
-) -> tuple[float, np.ndarray]:
-    context_radius = int(round(cfg.kalman_context_sec * cfg.fs))
-    min_context = int(round(8.0 * cfg.fs))
-    pre_start = max(0, start - context_radius)
-    post_end = min(len(resp), end + context_radius)
-
-    before_idx = np.arange(pre_start, start, dtype=int)
-    after_idx = np.arange(end, post_end, dtype=int)
-    before_idx = before_idx[~candidate_mask[before_idx]]
-    after_idx = after_idx[~candidate_mask[after_idx]]
-    context_idx = np.r_[before_idx, after_idx]
-
-    min_before = max(3, int(round(2.0 * cfg.fs)))
-    if context_idx.size < min_context or before_idx.size < min_before:
-        fallback_score = max(float(cfg.kalman_residual_threshold_z) + 1.0, 1.0)
-        return fallback_score, np.full(end - start, fallback_score, dtype=float)
-
-    context = resp[context_idx]
-    center, amp_scale = robust_scale(context)
-    y = (resp - center) / max(amp_scale, 1e-12)
-    freq_hz = estimate_breath_hz(context, cfg)
-    f = oscillator_transition(freq_hz, cfg)
-    q = np.eye(2, dtype=float) * 1e-4
-    r = 0.05
-
-    x = np.array([float(y[before_idx[0]]), 0.0], dtype=float)
-    p = np.eye(2, dtype=float)
-    innovations: list[float] = []
-    prev = int(before_idx[0])
-
-    for idx in before_idx[1:]:
-        steps = max(1, min(int(idx - prev), int(round(2.0 * cfg.fs))))
-        for _ in range(steps):
-            x, p = kalman_predict(x, p, f, q)
-        x, p, innovation = kalman_update(x, p, float(y[idx]), r)
-        innovations.append(innovation)
-        prev = int(idx)
-
-    if not innovations:
-        residual_scale = 1.0
-    else:
-        _, residual_scale = robust_scale(np.asarray(innovations, dtype=float))
-        residual_scale = max(residual_scale, r)
-
-    residual_z = np.zeros(end - start, dtype=float)
-    prev = int(before_idx[-1])
-    for out_i, idx in enumerate(range(start, end)):
-        steps = max(1, min(int(idx - prev), int(round(2.0 * cfg.fs))))
-        for _ in range(steps):
-            x, p = kalman_predict(x, p, f, q)
-        residual_z[out_i] = abs(float(y[idx]) - float(x[0])) / residual_scale
-        prev = int(idx)
-
-    score = float(np.nanpercentile(residual_z, 95.0))
-    return score, residual_z
-
-
-def verify_candidate_events(
-    candidate_mask: np.ndarray,
-    pvdf: np.ndarray,
-    pr_score: np.ndarray,
-    cfg: GateConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    verified = np.zeros_like(candidate_mask, dtype=bool)
-    residual_series = np.zeros_like(pvdf, dtype=float)
-    kalman_score_series = np.zeros_like(pvdf, dtype=float)
-    pr_score_series = np.zeros_like(pr_score, dtype=float)
-    verification_series = np.zeros_like(pvdf, dtype=float)
-    resp = kalman_breath_signal(pvdf, cfg)
-
-    for start, end in mask_runs(candidate_mask):
-        kalman_score, residual_z = kalman_segment_residual(resp, candidate_mask, start, end, cfg)
-        contact_score = float(np.nanpercentile(pr_score[start:end], 95.0))
-        kalman_norm = kalman_score / max(float(cfg.kalman_residual_threshold_z), 1e-12)
-        pr_norm = contact_score / max(float(cfg.pr_contact_threshold_z), 1e-12)
-        verification_score = max(kalman_norm, pr_norm)
-
-        residual_series[start:end] = residual_z
-        kalman_score_series[start:end] = kalman_score
-        pr_score_series[start:end] = contact_score
-        verification_series[start:end] = verification_score
-        if verification_score >= 1.0:
-            verified[start:end] = True
-
-    return verified, residual_series, kalman_score_series, pr_score_series, verification_series
+    min_len = int(round(cfg.motion_min_duration_sec * cfg.fs))
+    filtered = np.zeros_like(mask, dtype=bool)
+    for start, end in mask_runs(mask):
+        if end - start >= min_len:
+            filtered[start:end] = True
+    return filtered
 
 
 def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> dict[str, np.ndarray | float]:
@@ -486,44 +436,57 @@ def compute_motion_gate(pvdf: np.ndarray, pr: np.ndarray, cfg: GateConfig) -> di
 
     pvdf_score = weights[0] * pvdf_motion["voltage_rate_z"] + weights[1] * pvdf_motion["env_rate_z"]
     pr_score = weights[0] * pr_motion["voltage_rate_z"] + weights[1] * pr_motion["env_rate_z"]
+    candidate_score = moving_average(pr_score, int(round(1.0 * cfg.fs)))
+    split_pvdf_impulse_score = moving_average(pvdf_motion["voltage_rate_z"], int(round(1.0 * cfg.fs)))
+    split_score = split_pvdf_impulse_score.copy()
 
     edge = int(round(cfg.edge_guard_sec * cfg.fs))
     if edge > 0 and len(motion_score) > 2 * edge:
-        for arr in (pvdf_score, pr_score, voltage_score, envelope_score, motion_score):
+        for arr in (
+            pvdf_score,
+            pr_score,
+            voltage_score,
+            envelope_score,
+            motion_score,
+            candidate_score,
+            split_pvdf_impulse_score,
+            split_score,
+        ):
             arr[:edge] = 0.0
             arr[-edge:] = 0.0
 
     threshold = max(0.0, float(cfg.motion_threshold_z))
-    raw_candidate = motion_score > threshold
+    raw_candidate = candidate_score > threshold
     pre_dilated_candidate = expand_mask(raw_candidate, int(round(cfg.pre_motion_dilate_sec * cfg.fs)))
     candidate_event = merge_close_motion_segments(pre_dilated_candidate, cfg)
-    separated_event = separate_long_candidate_events(candidate_event, motion_score, pvdf_score, pr_score, cfg)
-    verified_motion, kalman_residual_series, kalman_score_series, pr_contact_score_series, verification_score = verify_candidate_events(
-        separated_event,
-        pvdf,
-        pr_score,
+    separated_event, split_threshold = separate_long_candidate_events(
+        candidate_event,
+        (split_pvdf_impulse_score,),
         cfg,
     )
+    verified_motion = remove_short_motion_cores(separated_event, cfg)
+    event_contact_score = segment_percentile_score(verified_motion, pr_score)
+    event_split_score = segment_percentile_score(verified_motion, split_score)
     final_motion = expand_mask(verified_motion, int(round(cfg.motion_dilate_sec * cfg.fs)))
 
     return {
         "pvdf_voltage_rate_z": pvdf_motion["voltage_rate_z"],
         "pr_voltage_rate_z": pr_motion["voltage_rate_z"],
         "pvdf_env_rate_z": pvdf_motion["env_rate_z"],
+        "pr_env_level_z": pr_motion["env_level_z"],
         "pr_env_rate_z": pr_motion["env_rate_z"],
         "pvdf_score": pvdf_score,
         "pr_score": pr_score,
         "voltage_score": voltage_score,
         "envelope_score": envelope_score,
         "motion_score": motion_score,
+        "candidate_score": candidate_score,
+        "split_pvdf_impulse_score": split_pvdf_impulse_score,
+        "split_score": split_score,
         "motion_threshold": float(threshold),
-        "kalman_residual_z": kalman_residual_series,
-        "kalman_segment_score": kalman_score_series,
-        "kalman_threshold": float(cfg.kalman_residual_threshold_z),
-        "pr_contact_segment_score": pr_contact_score_series,
-        "pr_contact_threshold": float(cfg.pr_contact_threshold_z),
-        "verification_score": verification_score,
-        "verification_threshold": 1.0,
+        "split_threshold": split_threshold,
+        "event_contact_score": event_contact_score,
+        "event_split_score": event_split_score,
         "raw_candidate_mask": raw_candidate,
         "pre_dilated_candidate_mask": pre_dilated_candidate,
         "candidate_event_mask": candidate_event,
@@ -564,30 +527,24 @@ def add_segment_diagnostics(
         return segments
 
     out = segments.copy()
+    max_candidate_score = []
+    mean_candidate_score = []
     max_motion_score = []
     mean_motion_score = []
-    max_kalman_residual_z = []
-    mean_kalman_residual_z = []
-    kalman_segment_score = []
-    pr_contact_segment_score = []
-    verification_score = []
+    event_contact_score = []
 
     for row in out.itertuples(index=False):
         start = int(row.start_idx)
         end = int(row.end_idx)
+        max_candidate_score.append(float(np.nanmax(gate["candidate_score"][start:end])))
+        mean_candidate_score.append(float(np.nanmean(gate["candidate_score"][start:end])))
         max_motion_score.append(float(np.nanmax(gate["motion_score"][start:end])))
         mean_motion_score.append(float(np.nanmean(gate["motion_score"][start:end])))
-        max_kalman_residual_z.append(float(np.nanmax(gate["kalman_residual_z"][start:end])))
-        mean_kalman_residual_z.append(float(np.nanmean(gate["kalman_residual_z"][start:end])))
-        kalman_segment_score.append(float(np.nanmax(gate["kalman_segment_score"][start:end])))
-        pr_contact_segment_score.append(float(np.nanmax(gate["pr_contact_segment_score"][start:end])))
-        verification_score.append(float(np.nanmax(gate["verification_score"][start:end])))
+        event_contact_score.append(float(np.nanmax(gate["event_contact_score"][start:end])))
 
-    out["kalman_segment_score"] = kalman_segment_score
-    out["pr_contact_segment_score"] = pr_contact_segment_score
-    out["verification_score"] = verification_score
-    out["max_kalman_residual_z"] = max_kalman_residual_z
-    out["mean_kalman_residual_z"] = mean_kalman_residual_z
+    out["event_contact_score"] = event_contact_score
+    out["max_candidate_score"] = max_candidate_score
+    out["mean_candidate_score"] = mean_candidate_score
     out["max_motion_score"] = max_motion_score
     out["mean_motion_score"] = mean_motion_score
     return out
@@ -651,24 +608,21 @@ def plot_overview(out_path: Path, data: dict[str, np.ndarray], gate: dict[str, n
     axes[0].set_ylabel("norm.")
     axes[0].legend(loc="upper right")
 
-    axes[1].plot(t[sl], gate["voltage_score"][sl], linewidth=0.7, label="voltage rate")
-    axes[1].plot(t[sl], gate["envelope_score"][sl], linewidth=0.7, label="envelope rate")
-    axes[1].plot(t[sl], gate["motion_score"][sl], color="tab:red", linewidth=0.9, label="fused")
-    axes[1].axhline(gate["motion_threshold"], color="black", linestyle="--", linewidth=1.0, label="threshold")
-    set_robust_ylim(axes[1], gate["motion_score"][sl], 0.0, 99.5)
+    axes[1].plot(t[sl], gate["candidate_score"][sl], color="tab:orange", linewidth=0.9, label="PR candidate score")
+    axes[1].plot(t[sl], gate["pvdf_score"][sl], color="tab:blue", linewidth=0.7, alpha=0.65, label="PVDF reference score")
+    axes[1].plot(t[sl], gate["motion_score"][sl], color="tab:red", linewidth=0.7, alpha=0.55, label="fused reference")
+    axes[1].axhline(gate["motion_threshold"], color="black", linestyle="--", linewidth=1.0, label="candidate threshold")
+    score_plot = np.r_[gate["candidate_score"][sl], gate["pvdf_score"][sl], gate["motion_score"][sl]]
+    set_robust_ylim(axes[1], score_plot, 0.0, 99.5)
     axes[1].set_ylabel("score")
     axes[1].legend(loc="upper right")
 
-    axes[2].plot(t[sl], gate["kalman_residual_z"][sl], color="tab:purple", linewidth=0.8, label="Kalman residual")
-    axes[2].plot(t[sl], gate["pr_score"][sl], color="tab:orange", linewidth=0.7, alpha=0.8, label="PR contact score")
-    axes[2].plot(t[sl], gate["verification_score"][sl], color="tab:green", linewidth=0.9, label="verification score")
-    if cfg.kalman_residual_threshold_z > 0:
-        axes[2].axhline(cfg.kalman_residual_threshold_z, color="black", linestyle="--", linewidth=1.0, label="Kalman threshold")
-    if cfg.pr_contact_threshold_z > 0:
-        axes[2].axhline(cfg.pr_contact_threshold_z, color="tab:orange", linestyle="--", linewidth=0.9, alpha=0.8, label="PR threshold")
-    axes[2].axhline(1.0, color="tab:green", linestyle="--", linewidth=0.9, alpha=0.8, label="verify threshold")
-    set_robust_ylim(axes[2], np.r_[gate["kalman_residual_z"][sl], gate["pr_score"][sl], gate["verification_score"][sl]], 0.0, 99.5)
-    axes[2].set_ylabel("confirm z")
+    axes[2].plot(t[sl], gate["split_pvdf_impulse_score"][sl], color="tab:blue", linewidth=0.8, alpha=0.8, label="PVDF impulse split score")
+    axes[2].plot(t[sl], gate["event_split_score"][sl], color="tab:green", linewidth=0.8, alpha=0.8, label="event P95 split score")
+    axes[2].plot(t[sl], gate["split_threshold"][sl], color="tab:purple", linewidth=0.9, alpha=0.8, label="Otsu split threshold")
+    split_plot = np.r_[gate["split_score"][sl], gate["event_split_score"][sl], gate["split_threshold"][sl]]
+    set_robust_ylim(axes[2], split_plot, 0.0, 99.5)
+    axes[2].set_ylabel("split score")
     axes[2].legend(loc="upper right")
 
     mask_lanes = [
@@ -707,7 +661,7 @@ def plot_detail(
     if len(t) == 0:
         return
 
-    center = int(np.argmax(gate["motion_score"]))
+    center = int(np.argmax(gate["candidate_score"]))
     half = int(round(0.5 * span_sec * cfg.fs))
     start = max(0, center - half)
     end = min(len(t), center + half)
@@ -723,22 +677,17 @@ def plot_detail(
     axes[0].set_ylabel("norm.")
     axes[0].legend(loc="upper right")
 
-    axes[1].plot(t[sl], gate["voltage_score"][sl], linewidth=0.8, label="voltage rate")
-    axes[1].plot(t[sl], gate["envelope_score"][sl], linewidth=0.8, label="envelope rate")
-    axes[1].plot(t[sl], gate["motion_score"][sl], color="tab:red", linewidth=1.0, label="fused")
+    axes[1].plot(t[sl], gate["candidate_score"][sl], color="tab:orange", linewidth=1.0, label="PR candidate score")
+    axes[1].plot(t[sl], gate["pvdf_score"][sl], color="tab:blue", linewidth=0.8, alpha=0.65, label="PVDF reference score")
+    axes[1].plot(t[sl], gate["motion_score"][sl], color="tab:red", linewidth=0.8, alpha=0.55, label="fused reference")
     axes[1].axhline(gate["motion_threshold"], color="black", linestyle="--", linewidth=1.0)
     axes[1].set_ylabel("score")
     axes[1].legend(loc="upper right")
 
-    axes[2].plot(t[sl], gate["kalman_residual_z"][sl], color="tab:purple", linewidth=0.9, label="Kalman residual")
-    axes[2].plot(t[sl], gate["pr_score"][sl], color="tab:orange", linewidth=0.8, alpha=0.8, label="PR contact score")
-    axes[2].plot(t[sl], gate["verification_score"][sl], color="tab:green", linewidth=0.9, label="verification score")
-    if cfg.kalman_residual_threshold_z > 0:
-        axes[2].axhline(cfg.kalman_residual_threshold_z, color="black", linestyle="--", linewidth=1.0)
-    if cfg.pr_contact_threshold_z > 0:
-        axes[2].axhline(cfg.pr_contact_threshold_z, color="tab:orange", linestyle="--", linewidth=0.9, alpha=0.8)
-    axes[2].axhline(1.0, color="tab:green", linestyle="--", linewidth=0.9, alpha=0.8)
-    axes[2].set_ylabel("confirm z")
+    axes[2].plot(t[sl], gate["split_pvdf_impulse_score"][sl], color="tab:blue", linewidth=0.9, alpha=0.8, label="PVDF impulse split score")
+    axes[2].plot(t[sl], gate["event_split_score"][sl], color="tab:green", linewidth=0.8, alpha=0.8, label="event P95 split score")
+    axes[2].plot(t[sl], gate["split_threshold"][sl], color="tab:purple", linewidth=0.9, alpha=0.8, label="Otsu split threshold")
+    axes[2].set_ylabel("split score")
     axes[2].legend(loc="upper right")
 
     mask_lanes = [
@@ -759,7 +708,7 @@ def plot_detail(
     axes[3].set_ylabel("steps")
     axes[3].set_xlabel("Time (s)")
 
-    fig.suptitle("Detail around strongest motion score", y=0.995)
+    fig.suptitle("Detail around strongest PR candidate score", y=0.995)
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
@@ -770,6 +719,9 @@ def build_step_table(data: dict[str, np.ndarray], gate: dict[str, np.ndarray | f
         {
             "time_sec": data["t"],
             "motion_score": gate["motion_score"],
+            "candidate_score": gate["candidate_score"],
+            "split_pvdf_impulse_score": gate["split_pvdf_impulse_score"],
+            "split_score": gate["split_score"],
             "motion_threshold": np.full_like(data["t"], float(gate["motion_threshold"]), dtype=float),
             "pvdf_score": gate["pvdf_score"],
             "pr_score": gate["pr_score"],
@@ -778,14 +730,11 @@ def build_step_table(data: dict[str, np.ndarray], gate: dict[str, np.ndarray | f
             "pvdf_voltage_rate_z": gate["pvdf_voltage_rate_z"],
             "pr_voltage_rate_z": gate["pr_voltage_rate_z"],
             "pvdf_env_rate_z": gate["pvdf_env_rate_z"],
+            "pr_env_level_z": gate["pr_env_level_z"],
             "pr_env_rate_z": gate["pr_env_rate_z"],
-            "kalman_residual_z": gate["kalman_residual_z"],
-            "kalman_segment_score": gate["kalman_segment_score"],
-            "kalman_threshold": np.full_like(data["t"], float(gate["kalman_threshold"]), dtype=float),
-            "pr_contact_segment_score": gate["pr_contact_segment_score"],
-            "pr_contact_threshold": np.full_like(data["t"], float(gate["pr_contact_threshold"]), dtype=float),
-            "verification_score": gate["verification_score"],
-            "verification_threshold": np.full_like(data["t"], float(gate["verification_threshold"]), dtype=float),
+            "split_threshold": gate["split_threshold"],
+            "event_contact_score": gate["event_contact_score"],
+            "event_split_score": gate["event_split_score"],
             "raw_candidate": np.asarray(gate["raw_candidate_mask"], dtype=np.uint8),
             "after_pre_dilate": np.asarray(gate["pre_dilated_candidate_mask"], dtype=np.uint8),
             "candidate_event": np.asarray(gate["candidate_event_mask"], dtype=np.uint8),
@@ -816,8 +765,8 @@ def make_summary(
         "processed_samples": int(len(data["t"])),
         "duration_sec": float(duration),
         "motion_threshold": float(gate["motion_threshold"]),
-        "kalman_residual_threshold_z": cfg.kalman_residual_threshold_z,
-        "pr_contact_threshold_z": cfg.pr_contact_threshold_z,
+        "split_method": "two_pass_otsu_pvdf_impulse_in_pr_candidates",
+        "motion_min_duration_sec": float(cfg.motion_min_duration_sec),
         "motion_seconds": motion_seconds,
         "motion_ratio": float(motion_seconds / duration) if duration else 0.0,
         "clean_seconds": clean_seconds,
@@ -837,8 +786,8 @@ def write_text_summary(path: Path, summary: dict[str, object]) -> None:
         f"Duration: {summary['duration_sec']:.1f} s",
         f"Processed sampling rate: {summary['fs_processed']:.1f} Hz",
         f"Motion threshold: {summary['motion_threshold']}",
-        f"Kalman residual threshold: {summary['kalman_residual_threshold_z']}",
-        f"PR contact threshold: {summary['pr_contact_threshold_z']}",
+        f"Split method: {summary['split_method']}",
+        f"Motion min duration: {summary['motion_min_duration_sec']} s",
         f"Motion seconds: {summary['motion_seconds']:.1f}",
         f"Motion ratio: {summary['motion_ratio']:.3f}",
         f"Clean seconds: {summary['clean_seconds']:.1f}",
